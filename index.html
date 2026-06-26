@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kimodo WebGPU — Text to Motion</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, sans-serif; background: #111; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+header { padding: 16px 24px; border-bottom: 1px solid #2a2a2a; }
+h1 { font-size: 18px; font-weight: 700; }
+.sub { font-size: 11px; color: #555; font-family: 'SF Mono', monospace; }
+main { flex: 1; display: flex; padding: 16px; gap: 16px; }
+#controls { width: 340px; flex-shrink: 0; }
+#viewport { flex: 1; background: #1a1a1a; border-radius: 8px; border: 1px solid #2a2a2a; position: relative; display: flex; align-items: center; justify-content: center; }
+#status { font-size: 13px; color: #555; }
+.panel { background: #1f1f1f; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+label { font-size: 11px; color: #888; display: block; margin-bottom: 4px; }
+textarea, input[type="number"] { width: 100%; padding: 8px; background: #252525; border: 1px solid #333; border-radius: 6px; color: #ccc; font-size: 12px; outline: none; margin-bottom: 8px; resize: vertical; }
+textarea:focus, input:focus { border-color: #1976d2; }
+button { padding: 8px 16px; background: #1565c0; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; width: 100%; margin-bottom: 8px; }
+button:hover { background: #1976d2; }
+button:disabled { background: #333; color: #666; cursor: not-allowed; }
+#progress { height: 4px; background: #252525; border-radius: 2px; margin-bottom: 8px; overflow: hidden; }
+#progress-bar { height: 100%; background: #1976d2; width: 0%; transition: width 0.3s; }
+#info { font-size: 10px; color: #555; font-family: 'SF Mono', monospace; }
+canvas { border-radius: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kimodo WebGPU</h1>
+  <div class="sub">text-to-motion diffusion — 282M params in the browser</div>
+</header>
+<main>
+  <div id="controls">
+    <div class="panel">
+      <label>Text embedding server</label>
+      <input type="text" id="server-url" value="http://localhost:8098" placeholder="http://localhost:8098">
+    </div>
+
+    <div class="panel">
+      <label>Prompt</label>
+      <textarea id="prompt" rows="3" placeholder="A person walks forward and waves their hand."></textarea>
+      <label>Duration (seconds)</label>
+      <input type="number" id="duration" value="6" min="1" max="18" step="1">
+      <label>Diffusion steps</label>
+      <input type="number" id="steps" value="100" min="10" max="200" step="10">
+    </div>
+
+    <button id="generate-btn" onclick="generate()">Generate Motion</button>
+    <div id="progress"><div id="progress-bar"></div></div>
+    <div id="info"></div>
+  </div>
+  <div id="viewport">
+    <div id="status">Initializing WebGPU...</div>
+  </div>
+</main>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

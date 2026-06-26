@@ -1,0 +1,17 @@
+{
+  "name": "kimodo-webgpu",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Kimodo text-to-motion diffusion model running in WebGPU compute shaders",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.2.1"
+  }
+}
