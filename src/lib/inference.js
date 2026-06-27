@@ -48,7 +48,11 @@ function positionalEncoding(maxLen, dim = D) {
 /**
  * Run one transformer sub-network forward pass.
  */
-export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim) {
+/**
+ * @param {GPUBuffer|null} keyMaskBuf - optional [totalSeqLen] float buffer for attention masking.
+ *   0.0 = attend, -1e9 = mask out. Used for CFG unconditioned pass (mask text tokens).
+ */
+export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null) {
   const textLen = 1;
   const totalSeqLen = textLen + 1 + seqLen; // text + timestep + motion
   const prefixLen = textLen + 1;
@@ -131,6 +135,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     const attnOutBuf = createEmptyBuffer(device, N * D * 4);
     dispatchAttention(device, enc, qBuf, kBuf, vBuf, scoresBuf, {
       N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: attnOutBuf,
+      maskBuf: keyMaskBuf,
     });
 
     // Output projection + residual + norm1

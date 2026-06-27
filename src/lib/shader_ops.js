@@ -281,8 +281,12 @@ export function dispatchQKVSplit(device, encoder, qkvBuf, qBuf, kBuf, vBuf, N, D
  * qBuf: [N, D], kBuf: [N, D], vBuf: [N, D]
  * Returns attention output in outputBuf [N, D]
  */
+/**
+ * @param {object} params - { N, D, numHeads, headDim, outputBuf, maskBuf? }
+ *   maskBuf: optional [N] float buffer. 0.0 = valid, -1e9 = masked. If null, no masking.
+ */
 export function dispatchAttention(device, encoder, qBuf, kBuf, vBuf, scoresBuf, params) {
-  const { N, D, numHeads, headDim } = params;
+  const { N, D, numHeads, headDim, maskBuf } = params;
   const scale = 1.0 / Math.sqrt(headDim);
 
   // 1. Compute scores: Q @ K^T
@@ -312,18 +316,23 @@ export function dispatchAttention(device, encoder, qBuf, kBuf, vBuf, scoresBuf, 
   pass.dispatchWorkgroups(sWgX, sWgY);
   pass.end();
 
-  // 2. Softmax
+  // 2. Softmax with optional mask
   const softmaxRows = numHeads * N;
   const smWG = ceil(softmaxRows, 256);
   const [smWgX, smWgY] = splitWorkgroups(smWG);
+  const hasMask = maskBuf ? 1 : 0;
 
-  const smUniform = cachedUniform(device, new Uint32Array([N, numHeads, smWgX]));
-  const smPipeline = getOrCreatePipeline(device, 'attn_softmax', attentionWGSL, 'softmax');
+  // Dummy mask buffer (1 float) when no masking — needed for bind group layout
+  const actualMaskBuf = maskBuf || createStorageBuffer(device, new Float32Array([0]));
+
+  const smUniform = cachedUniform(device, new Uint32Array([N, numHeads, hasMask, smWgX]));
+  const smPipeline = getOrCreatePipeline(device, 'attn_softmax_masked', attentionWGSL, 'softmaxMasked');
   const smGroup = device.createBindGroup({
     layout: smPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: smUniform } },
       { binding: 1, resource: { buffer: scoresBuf } },
+      { binding: 2, resource: { buffer: actualMaskBuf } },
     ],
   });
 

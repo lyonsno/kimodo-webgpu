@@ -1,9 +1,7 @@
-// Multi-head self-attention compute shaders for DINOv2 ViT.
-// Adapted from webgpu-samples visionTransformer with 2D dispatch.
-//
+// Multi-head self-attention compute shaders.
 // Three entry points:
 //   computeScores: Q·K^T scaled dot product → scores
-//   softmax: row-wise numerically stable softmax
+//   softmaxMasked: row-wise numerically stable softmax with key padding mask
 //   applyAttn: scores @ V → output
 
 struct ScoreParams {
@@ -18,6 +16,7 @@ struct ScoreParams {
 struct SoftmaxParams {
   N: u32,
   numHeads: u32,
+  hasMask: u32,  // 1 if mask buffer is valid, 0 if no masking
   numWorkgroupsX: u32,
 }
 
@@ -57,7 +56,6 @@ fn computeScores(
   let ki = remainder % N;
   let headOffset = head * headDim;
 
-  // headDim is 64, so 4-way split gives 16-element chains.
   var d0 = 0.0;
   var d1 = 0.0;
   var d2 = 0.0;
@@ -78,13 +76,14 @@ fn computeScores(
   scoreBuf[idx] = ((d0 + d1) + (d2 + d3)) * scoreParams.scale;
 }
 
-// --- Softmax ---
-// Uses separate bind group with SoftmaxParams
+// --- Softmax with optional key padding mask ---
+// maskBuf[ki] = 0.0 for valid keys, -1e9 for masked keys (added to scores before softmax)
 @group(0) @binding(0) var<uniform> softmaxParams: SoftmaxParams;
 @group(0) @binding(1) var<storage, read_write> softmaxScoreBuf: array<f32>;
+@group(0) @binding(2) var<storage, read> maskBuf: array<f32>;
 
 @compute @workgroup_size(256)
-fn softmax(
+fn softmaxMasked(
   @builtin(workgroup_id) wgid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
@@ -93,10 +92,18 @@ fn softmax(
 
   let N = softmaxParams.N;
   let totalRows = softmaxParams.numHeads * N;
+  let hasMask = softmaxParams.hasMask;
 
   if (idx >= totalRows) { return; }
 
   let base = idx * N;
+
+  // Apply mask (add -1e9 to masked positions)
+  if (hasMask == 1u) {
+    for (var i = 0u; i < N; i++) {
+      softmaxScoreBuf[base + i] = softmaxScoreBuf[base + i] + maskBuf[i];
+    }
+  }
 
   // Find max
   var m = -1e30;
@@ -144,7 +151,6 @@ fn applyAttn(
   let head = col / headDim;
   let d = col % headDim;
 
-  // N is ~1370 tokens, 4-way split gives ~342-element chains.
   var v0 = 0.0;
   var v1 = 0.0;
   var v2 = 0.0;

@@ -9,6 +9,7 @@
 import { initGPU } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
+import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 
 const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
@@ -18,6 +19,7 @@ const generateBtn = document.getElementById('generate-btn');
 let gpuDevice = null;
 let modelConfig = null;
 let modelWeights = null;
+let motionRepStats = null;
 
 async function init() {
   try {
@@ -71,6 +73,9 @@ async function init() {
     modelWeights = await loadWeights(gpuDevice, buffer);
     const uploadTime = ((performance.now() - t1) / 1000).toFixed(1);
 
+    // Load motion_rep stats for root conversion
+    motionRepStats = await loadMotionRepStats('/motion_rep_stats.json');
+
     progressBar.style.width = '100%';
     statusEl.textContent = `Ready. Weights loaded in ${downloadTime}s (download) + ${uploadTime}s (GPU upload).`;
     infoEl.textContent += ` | ${(loaded / 1e6).toFixed(0)} MB | ${downloadTime}s + ${uploadTime}s`;
@@ -116,7 +121,7 @@ async function generate() {
     const textEmbedding = new Float32Array(embData.embedding);
 
     // Client-side DDIM loop with server-side denoising steps
-    statusEl.textContent = `Running ${numSteps}-step DDIM in browser...`;
+    statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;
     const t0 = performance.now();
     const motionDim = 369; // root(5) + body(364)
 
@@ -167,24 +172,46 @@ async function generate() {
     for (let step = numSteps - 1; step >= 0; step--) {
       const pct = Math.round(100 * (numSteps - step) / numSteps);
       progressBar.style.width = `${pct}%`;
-      statusEl.textContent = `DDIM step ${numSteps - step}/${numSteps} (${pct}%)`;
+      statusEl.textContent = `WebGPU DDIM step ${numSteps - step}/${numSteps} (${pct}%)`;
 
-      // Server-side denoising: send noisy motion, get clean prediction
-      const stepResp = await fetch(`${serverUrl}/denoise_step`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          motion,
-          text_emb: Array.from(textEmbedding),
-          timestep: useTimesteps[step],
-          heading: 0.0,
-        }),
-      });
-      const stepData = await stepResp.json();
-      if (stepData.error) { statusEl.textContent = `Step error: ${stepData.error}`; return; }
+      // Toggle: use WebGPU or server for denoising
+      const USE_WEBGPU_DENOISER = true; // toggle: false=server, true=WebGPU
+      // On first step, compare WebGPU vs server output
+      if (step === numSteps - 1) {
+        const serverResp = await fetch(`${serverUrl}/denoise_step`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ motion, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step], heading: 0.0 }),
+        });
+        const serverData = await serverResp.json();
+        if (!serverData.error) {
+          const sp = serverData.prediction;
+          console.log('[compare] Server root[0]: ' + JSON.stringify(sp[0].slice(0, 5)));
+          console.log('[compare] Server body[0][0:5]: ' + JSON.stringify(sp[0].slice(5, 10)));
+          // WebGPU will be computed below
+        }
+      }
+      let predClean;
+      if (USE_WEBGPU_DENOISER) {
+        predClean = await denoiseStepWebGPU(
+          gpuDevice, modelWeights, Array.from(textEmbedding),
+          motion, useTimesteps[step], motionRepStats,
+        );
+      } else {
+        const stepResp = await fetch(`${serverUrl}/denoise_step`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ motion, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step], heading: 0.0 }),
+        });
+        const stepData = await stepResp.json();
+        if (stepData.error) { statusEl.textContent = `Step error: ${stepData.error}`; return; }
+        predClean = stepData.prediction;
+      }
 
-      const predClean = stepData.prediction; // [N, 369]
-
+      if (step === numSteps - 1) {
+        console.log('[compare] WebGPU root[0]: ' + JSON.stringify(predClean[0].slice(0, 5)));
+        console.log('[compare] WebGPU body[0][0:5]: ' + JSON.stringify(predClean[0].slice(5, 10)));
+      }
       // DDIM update: compute eps, then x_{t-1}
       const sqrtRecip = sqrtRecipAlphasCumprod[step];
       const sqrtRecipm1 = sqrtRecipm1AlphasCumprod[step];
@@ -218,7 +245,7 @@ async function generate() {
       progressBar.style.width = '100%';
       infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s | ${numSteps} DDIM steps (browser loop)`;
       renderSkeletonFromJoints(decoded);
-      statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (browser DDIM → ${decoded.num_joints} joints)`;
+      statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion → ${decoded.num_joints} joints)`;
     }
 
   } catch (err) {
