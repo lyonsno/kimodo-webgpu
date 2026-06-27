@@ -10,6 +10,7 @@ import { initGPU } from './lib/gpu.js';
 import { loadWeights } from './lib/weights.js';
 import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
+import { loadFKData, decodeMotion } from './lib/fk_decode.js';
 
 const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
@@ -73,8 +74,9 @@ async function init() {
     modelWeights = await loadWeights(gpuDevice, buffer);
     const uploadTime = ((performance.now() - t1) / 1000).toFixed(1);
 
-    // Load motion_rep stats for root conversion
+    // Load motion_rep stats for root conversion + FK data
     motionRepStats = await loadMotionRepStats('/motion_rep_stats.json');
+    await loadFKData('/fk_data.json');
 
     progressBar.style.width = '100%';
     statusEl.textContent = `Ready. Weights loaded in ${downloadTime}s (download) + ${uploadTime}s (GPU upload).`;
@@ -240,25 +242,16 @@ async function generate() {
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
     statusEl.textContent = `Generated in ${genTime}s — decoding to joints...`;
 
-    // Decode final motion to joint positions
-    const bodyFeatures = motion.map(f => f.slice(5)); // body = [5:369]
-    const rootFeatures = motion.map(f => f.slice(0, 5)); // root = [0:5]
+    // Decode motion features to joint positions — entirely client-side!
+    const t1 = performance.now();
+    const decoded = decodeMotion(motion);
+    const decodeTime = ((performance.now() - t1)).toFixed(0);
+    console.log(`[kimodo-webgpu] FK decode: ${decodeTime}ms for ${decoded.num_frames} frames`);
 
-    const decodeResp = await fetch(`${serverUrl}/decode`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ body_features: bodyFeatures, root_features: rootFeatures }),
-    });
-    const decoded = await decodeResp.json();
-
-    if (decoded.error) {
-      statusEl.textContent = `Decode error: ${decoded.error}`;
-    } else {
-      progressBar.style.width = '100%';
-      infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s | ${numSteps} DDIM steps (browser loop)`;
-      renderSkeletonFromJoints(decoded);
-      statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion → ${decoded.num_joints} joints)`;
-    }
+    progressBar.style.width = '100%';
+    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | fully client-side`;
+    renderSkeletonFromJoints(decoded);
+    statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
     statusEl.textContent = `Error: ${err.message}`;
@@ -454,7 +447,7 @@ function renderSkeletonFromJoints(decoded) {
     // Info
     ctx.fillStyle = '#666';
     ctx.font = '12px monospace';
-    ctx.fillText(`Frame ${frame}/${numFrames} | ${numJoints} joints | WebGPU → Server FK`, 10, H - 10);
+    ctx.fillText(`Frame ${frame}/${numFrames} | ${numJoints} joints | WebGPU diffusion + JS FK`, 10, H - 10);
 
     frame = (frame + 1) % numFrames;
   }, 1000 / 30);
