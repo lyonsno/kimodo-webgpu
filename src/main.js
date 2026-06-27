@@ -115,29 +115,111 @@ async function generate() {
     const embData = await embResp.json();
     const textEmbedding = new Float32Array(embData.embedding);
 
-    // Use full MPS generation via /generate for proper DDIM quality
-    statusEl.textContent = `Generating ${numFrames} frames via server (full DDIM)...`;
+    // Client-side DDIM loop with server-side denoising steps
+    statusEl.textContent = `Running ${numSteps}-step DDIM in browser...`;
     const t0 = performance.now();
+    const motionDim = 369; // root(5) + body(364)
 
-    const genResp = await fetch(`${serverUrl}/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, duration, steps: numSteps }),
-    });
-    const genData = await genResp.json();
+    // Cosine beta schedule (matching Kimodo's diffusion.py)
+    function alphaBarFn(t) { return Math.cos((t + 0.008) / 1.008 * Math.PI / 2) ** 2; }
+    const numBase = 1000;
+    const betasBase = [];
+    for (let i = 0; i < numBase; i++) {
+      betasBase.push(Math.min(1 - alphaBarFn((i+1)/numBase) / alphaBarFn(i/numBase), 0.999));
+    }
+    const alphasCumprodBase = [];
+    let acc = 1;
+    for (const b of betasBase) { acc *= (1 - b); alphasCumprodBase.push(acc); }
 
-    if (genData.error) {
-      statusEl.textContent = `Error: ${genData.error}`;
-      return;
+    // Subsample timesteps
+    const fracStride = (numBase - 1) / Math.max(1, numSteps - 1);
+    const useTimesteps = [];
+    for (let i = 0; i < numSteps; i++) {
+      useTimesteps.push(Math.min(Math.round(i * fracStride), numBase - 1));
+    }
+
+    // Compute diffusion vars matching Kimodo's calc_diffusion_vars exactly:
+    // 1. Get base alphas_cumprod at subsampled positions
+    // 2. Recompute betas from consecutive ratios
+    // 3. Recompute alphas_cumprod from those betas
+    const subsampledAlphasCumprod = useTimesteps.map(t => alphasCumprodBase[t]);
+    const lastAlphasCumprod = [1.0, ...subsampledAlphasCumprod.slice(0, -1)];
+    const betas = subsampledAlphasCumprod.map((ac, i) => 1.0 - ac / lastAlphasCumprod[i]);
+    const alphas = betas.map(b => 1.0 - b);
+    const alphasCumprod = [];
+    let cumprod = 1.0;
+    for (const a of alphas) { cumprod *= a; alphasCumprod.push(Math.max(cumprod, 1e-9)); }
+    const alphasCumprodPrev = [1.0, ...alphasCumprod.slice(0, -1)];
+    const sqrtRecipAlphasCumprod = alphasCumprod.map(a => 1 / Math.sqrt(a));
+    const sqrtRecipm1AlphasCumprod = alphasCumprod.map(a => Math.sqrt((1 - a) / a));
+
+    // Initialize with Gaussian noise [numFrames, 369]
+    const motion = new Array(numFrames);
+    for (let f = 0; f < numFrames; f++) {
+      motion[f] = new Array(motionDim);
+      for (let d = 0; d < motionDim; d++) {
+        const u1 = Math.random(), u2 = Math.random();
+        motion[f][d] = Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2);
+      }
+    }
+
+    // DDIM loop (reverse: t = numSteps-1 down to 0)
+    for (let step = numSteps - 1; step >= 0; step--) {
+      const pct = Math.round(100 * (numSteps - step) / numSteps);
+      progressBar.style.width = `${pct}%`;
+      statusEl.textContent = `DDIM step ${numSteps - step}/${numSteps} (${pct}%)`;
+
+      // Server-side denoising: send noisy motion, get clean prediction
+      const stepResp = await fetch(`${serverUrl}/denoise_step`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          motion,
+          text_emb: Array.from(textEmbedding),
+          timestep: useTimesteps[step],
+          heading: 0.0,
+        }),
+      });
+      const stepData = await stepResp.json();
+      if (stepData.error) { statusEl.textContent = `Step error: ${stepData.error}`; return; }
+
+      const predClean = stepData.prediction; // [N, 369]
+
+      // DDIM update: compute eps, then x_{t-1}
+      const sqrtRecip = sqrtRecipAlphasCumprod[step];
+      const sqrtRecipm1 = sqrtRecipm1AlphasCumprod[step];
+      const alphaBarPrev = alphasCumprodPrev[step];
+
+      for (let f = 0; f < numFrames; f++) {
+        for (let d = 0; d < motionDim; d++) {
+          const eps = (sqrtRecip * motion[f][d] - predClean[f][d]) / sqrtRecipm1;
+          motion[f][d] = predClean[f][d] * Math.sqrt(alphaBarPrev) + Math.sqrt(1 - alphaBarPrev) * eps;
+        }
+      }
     }
 
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
-    progressBar.style.width = '100%';
-    statusEl.textContent = `Generated ${genData.num_frames} frames in ${genTime}s — rendering...`;
-    infoEl.textContent = `${genData.num_frames}f @ ${genData.fps}fps | ${genTime}s server (${genData.gen_time}s model)`;
+    statusEl.textContent = `Generated in ${genTime}s — decoding to joints...`;
 
-    renderSkeletonFromJoints(genData);
-    statusEl.textContent = `Generated ${genData.num_frames} frames in ${genTime}s (${genData.num_joints} joints)`;
+    // Decode final motion to joint positions
+    const bodyFeatures = motion.map(f => f.slice(5)); // body = [5:369]
+    const rootFeatures = motion.map(f => f.slice(0, 5)); // root = [0:5]
+
+    const decodeResp = await fetch(`${serverUrl}/decode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body_features: bodyFeatures, root_features: rootFeatures }),
+    });
+    const decoded = await decodeResp.json();
+
+    if (decoded.error) {
+      statusEl.textContent = `Decode error: ${decoded.error}`;
+    } else {
+      progressBar.style.width = '100%';
+      infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s | ${numSteps} DDIM steps (browser loop)`;
+      renderSkeletonFromJoints(decoded);
+      statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (browser DDIM → ${decoded.num_joints} joints)`;
+    }
 
   } catch (err) {
     statusEl.textContent = `Error: ${err.message}`;
