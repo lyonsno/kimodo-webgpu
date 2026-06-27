@@ -23,21 +23,25 @@ const NUM_HEADS = 8;
 const HEAD_DIM = 128;
 
 function sinusoidalEmbedding(timestep, dim = D) {
-  const half = dim / 2;
+  // Match PyTorch's PositionalEncoding exactly:
+  //   div_term = pow(10000, -arange(0, d, 2) / d)
+  //   pe[0::2] = sin(position * div_term)
+  //   pe[1::2] = cos(position * div_term)
   const emb = new Float32Array(dim);
-  for (let i = 0; i < half; i++) {
-    const freq = Math.exp(-Math.log(10000) * i / half);
+  for (let i = 0; i < dim; i += 2) {
+    const freq = Math.pow(10000.0, -i / dim);
     emb[i] = Math.sin(timestep * freq);
-    emb[i + half] = Math.cos(timestep * freq);
+    emb[i + 1] = Math.cos(timestep * freq);
   }
   return emb;
 }
 
 function positionalEncoding(maxLen, dim = D) {
+  // Match PyTorch's PositionalEncoding: pow(10000, -arange(0,d,2)/d)
   const pe = new Float32Array(maxLen * dim);
   for (let pos = 0; pos < maxLen; pos++) {
     for (let i = 0; i < dim; i += 2) {
-      const freq = Math.exp(-Math.log(10000) * i / dim);
+      const freq = Math.pow(10000.0, -i / dim);
       pe[pos * dim + i] = Math.sin(pos * freq);
       pe[pos * dim + i + 1] = Math.cos(pos * freq);
     }
@@ -53,10 +57,10 @@ function positionalEncoding(maxLen, dim = D) {
  *   0.0 = attend, -1e9 = mask out. Used for CFG unconditioned pass (mask text tokens).
  */
 export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null) {
-  const textLen = 1;
-  const totalSeqLen = textLen + 1 + seqLen; // text + timestep + motion
-  const prefixLen = textLen + 1;
-  const N = totalSeqLen;
+  const textLen = 1;   // actual text tokens from encoder
+  const numTextTokens = 50; // backbone pads to this fixed size
+  const totalSeqLen = numTextTokens + 1 + 1 + seqLen; // padded_text(50) + timestep(1) + heading(1) + motion
+  const prefixLen = numTextTokens + 1 + 1; // text + timestep + heading
 
   // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
   let enc = device.createCommandEncoder();
@@ -65,10 +69,19 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     numRows: seqLen, inDim: inputDim, outDim: D, outputBuf: projMotionBuf,
   });
 
-  // Step 2: Project text [1, 4096] -> [1, D]
-  const projTextBuf = createEmptyBuffer(device, D * 4);
-  dispatchLinear(device, enc, textBuf, weights.embedText.weight, weights.embedText.bias, {
-    numRows: 1, inDim: 4096, outDim: D, outputBuf: projTextBuf,
+  // Step 2: Create padded text [numTextTokens, 4096] — first token = real text, rest = zeros
+  // Then project ALL tokens through embed_text so bias is applied to padding positions too
+  const paddedTextInput = createEmptyBuffer(device, numTextTokens * 4096 * 4); // zero-init
+  // Copy real text into first row
+  enc.copyBufferToBuffer(textBuf, 0, paddedTextInput, 0, 4096 * 4);
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  // Project all 50 tokens: [50, 4096] -> [50, D] (zeros get projected to bias)
+  enc = device.createCommandEncoder();
+  const projTextBuf = createEmptyBuffer(device, numTextTokens * D * 4);
+  dispatchLinear(device, enc, paddedTextInput, weights.embedText.weight, weights.embedText.bias, {
+    numRows: numTextTokens, inDim: 4096, outDim: D, outputBuf: projTextBuf,
   });
 
   // Step 3: Timestep MLP — sinusoidal -> Linear -> SiLU -> Linear
@@ -78,10 +91,8 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchLinear(device, enc, sinEmbBuf, weights.timestepMLP.linear1.weight, weights.timestepMLP.linear1.bias, {
     numRows: 1, inDim: D, outDim: D, outputBuf: tsTemp,
   });
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  // (projTextBuf is dispatched but not submitted yet — will submit with timestep)
 
-  enc = device.createCommandEncoder();
   dispatchSiLU(device, enc, tsTemp, D);
   const tsEmbBuf = createEmptyBuffer(device, D * 4);
   dispatchLinear(device, enc, tsTemp, weights.timestepMLP.linear2.weight, weights.timestepMLP.linear2.bias, {
@@ -90,11 +101,29 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   device.queue.submit([enc.finish()]);
   await device.queue.onSubmittedWorkDone();
 
-  // Step 4: Concatenate [text, timestep, motion] -> [N, D]
+  // Step 3b: Heading angle token — cos(0)/sin(0) projected to D
+  const headingInput = new Float32Array([Math.cos(0), Math.sin(0)]); // heading=0
+  const headingBuf = createStorageBuffer(device, headingInput);
+  const headingProjBuf = createEmptyBuffer(device, D * 4);
+  enc = device.createCommandEncoder(); // NEW encoder — previous was finished
+  dispatchLinear(device, enc, headingBuf, weights.headingLinear.weight, weights.headingLinear.bias, {
+    numRows: 1, inDim: 2, outDim: D, outputBuf: headingProjBuf,
+  });
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  // Step 4: Concatenate [paddedText(50), timestep(1), heading(1), motion(seqLen)] -> [N, D]
+  // N = totalSeqLen = 50 + 1 + 1 + seqLen
+  const N = totalSeqLen;
   const xseqBuf = createEmptyBuffer(device, N * D * 4);
   enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(projTextBuf, 0, xseqBuf, 0, D * 4);
-  enc.copyBufferToBuffer(tsEmbBuf, 0, xseqBuf, D * 4, D * 4);
+  // All 50 projected text tokens (real text at pos 0, bias-only padding at pos 1-49)
+  enc.copyBufferToBuffer(projTextBuf, 0, xseqBuf, 0, numTextTokens * D * 4);
+  // Timestep at position 50
+  enc.copyBufferToBuffer(tsEmbBuf, 0, xseqBuf, numTextTokens * D * 4, D * 4);
+  // Heading at position 51
+  enc.copyBufferToBuffer(headingProjBuf, 0, xseqBuf, (numTextTokens + 1) * D * 4, D * 4);
+  // Motion at positions 52+
   enc.copyBufferToBuffer(projMotionBuf, 0, xseqBuf, prefixLen * D * 4, seqLen * D * 4);
   device.queue.submit([enc.finish()]);
   await device.queue.onSubmittedWorkDone();
@@ -107,6 +136,14 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchAdd(device, enc, xseqBuf, peBuf, xseqWithPE, N * D);
   device.queue.submit([enc.finish()]);
   await device.queue.onSubmittedWorkDone();
+
+  // Debug: dump xseq tokens for comparison
+  const dbgXseq = await readBuffer(device, xseqWithPE, Math.min(N * D, 53 * D));
+  console.log('[xseq] N=' + N + ' token0[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(0, 5))));
+  console.log('[xseq] token1[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(D, D+5))));
+  console.log('[xseq] token50[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(50*D, 50*D+5))));
+  if (N > 51) console.log('[xseq] token51[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(51*D, 51*D+5))));
+  if (N > 52) console.log('[xseq] token52[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(52*D, 52*D+5))));
 
   // Step 6: 16 Transformer Encoder Layers (post-norm)
   let currentBuf = xseqWithPE;
@@ -193,8 +230,10 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   await device.queue.onSubmittedWorkDone();
 
   // Cleanup
-  projMotionBuf.destroy(); projTextBuf.destroy(); sinEmbBuf.destroy();
-  tsTemp.destroy(); tsEmbBuf.destroy(); xseqBuf.destroy(); peBuf.destroy();
+  projMotionBuf.destroy(); paddedTextInput.destroy(); projTextBuf.destroy();
+  sinEmbBuf.destroy(); tsTemp.destroy(); tsEmbBuf.destroy();
+  headingBuf.destroy(); headingProjBuf.destroy();
+  xseqBuf.destroy(); peBuf.destroy();
   xseqWithPE.destroy(); motionOutBuf.destroy(); currentBuf.destroy();
 
   return finalOutBuf;

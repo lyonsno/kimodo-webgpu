@@ -119,6 +119,8 @@ async function generate() {
 
     const embData = await embResp.json();
     const textEmbedding = new Float32Array(embData.embedding);
+    console.log('[kimodo-webgpu] embed received[0:5]: ' + JSON.stringify([textEmbedding[0], textEmbedding[1], textEmbedding[2], textEmbedding[3], textEmbedding[4]]));
+    console.log('[kimodo-webgpu] embed length: ' + textEmbedding.length);
 
     // Client-side DDIM loop with server-side denoising steps
     statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;
@@ -175,42 +177,52 @@ async function generate() {
       statusEl.textContent = `WebGPU DDIM step ${numSteps - step}/${numSteps} (${pct}%)`;
 
       // Toggle: use WebGPU or server for denoising
-      const USE_WEBGPU_DENOISER = true; // toggle: false=server, true=WebGPU
-      // On first step, compare WebGPU vs server output
-      if (step === numSteps - 1) {
-        const serverResp = await fetch(`${serverUrl}/denoise_step`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ motion, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step], heading: 0.0 }),
-        });
-        const serverData = await serverResp.json();
-        if (!serverData.error) {
-          const sp = serverData.prediction;
-          console.log('[compare] Server root[0]: ' + JSON.stringify(sp[0].slice(0, 5)));
-          console.log('[compare] Server body[0][0:5]: ' + JSON.stringify(sp[0].slice(5, 10)));
-          // WebGPU will be computed below
-        }
-      }
-      let predClean;
-      if (USE_WEBGPU_DENOISER) {
-        predClean = await denoiseStepWebGPU(
-          gpuDevice, modelWeights, Array.from(textEmbedding),
-          motion, useTimesteps[step], motionRepStats,
-        );
-      } else {
-        const stepResp = await fetch(`${serverUrl}/denoise_step`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ motion, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step], heading: 0.0 }),
-        });
-        const stepData = await stepResp.json();
-        if (stepData.error) { statusEl.textContent = `Step error: ${stepData.error}`; return; }
-        predClean = stepData.prediction;
-      }
+      // WebGPU denoising
+      const predClean = await denoiseStepWebGPU(
+        gpuDevice, modelWeights, Array.from(textEmbedding),
+        motion, useTimesteps[step], motionRepStats,
+      );
 
-      if (step === numSteps - 1) {
-        console.log('[compare] WebGPU root[0]: ' + JSON.stringify(predClean[0].slice(0, 5)));
-        console.log('[compare] WebGPU body[0][0:5]: ' + JSON.stringify(predClean[0].slice(5, 10)));
+      if (false && step === numSteps - 1) {
+        // Compare raw root model forward pass (no CFG, no TwostageDenoiser)
+        // Construct root input: [motion(369), zeros(369)] = [N, 738]
+        const rootInput = motion.map(f => [...f, ...new Array(369).fill(0)]);
+
+        // Server: raw root model
+        const srvResp = await fetch(`${serverUrl}/forward_root`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ root_input: rootInput, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step] }),
+        });
+        const srvData = await srvResp.json();
+
+        // WebGPU: raw root model forward pass
+        const { createStorageBuffer } = await import('./lib/gpu.js');
+        const { forwardTransformer, readBuffer } = await import('./lib/inference.js');
+        const rootInputFlat = new Float32Array(motion.length * 738);
+        for (let f = 0; f < motion.length; f++) {
+          for (let d = 0; d < 369; d++) rootInputFlat[f * 738 + d] = motion[f][d];
+        }
+        const rootInputBuf = createStorageBuffer(gpuDevice, rootInputFlat);
+        const textBufCompare = createStorageBuffer(gpuDevice, new Float32Array(textEmbedding));
+        const gpuOutBuf = await forwardTransformer(gpuDevice, modelWeights.root, rootInputBuf, textBufCompare, useTimesteps[step], motion.length, 738, 5);
+        const gpuOut = await readBuffer(gpuDevice, gpuOutBuf, motion.length * 5);
+        rootInputBuf.destroy(); textBufCompare.destroy(); gpuOutBuf.destroy();
+
+        if (!srvData.error) {
+          console.log('[raw-root] Server out[0]: ' + JSON.stringify(srvData.output[0]));
+          console.log('[raw-root] WebGPU out[0]: ' + JSON.stringify(Array.from(gpuOut.slice(0, 5))));
+          if (srvData.xseq) {
+            console.log('[raw-root] Server xseq shape: ' + JSON.stringify(srvData.xseq.shape));
+            console.log('[raw-root] Server xseq[0] (text): ' + JSON.stringify(srvData.xseq.token0));
+            console.log('[raw-root] Server xseq[1] (pad): ' + JSON.stringify(srvData.xseq.token1));
+            console.log('[raw-root] Server xseq[50] (ts): ' + JSON.stringify(srvData.xseq.token50));
+            console.log('[raw-root] Server xseq[51] (hd): ' + JSON.stringify(srvData.xseq.token51));
+            console.log('[raw-root] Server xseq[52] (m0): ' + JSON.stringify(srvData.xseq.token52));
+          }
+        } else {
+          console.log('[raw-root] Server error: ' + srvData.error);
+        }
       }
       // DDIM update: compute eps, then x_{t-1}
       const sqrtRecip = sqrtRecipAlphasCumprod[step];

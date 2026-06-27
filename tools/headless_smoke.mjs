@@ -47,7 +47,7 @@ async function main() {
     const text = msg.text();
     logs.push({ type: msg.type(), text });
     // Print debug lines immediately
-    if (text.includes('[debug') || text.includes('[weights]') || text.includes('[kimodo') || text.includes('[smoke') || text.includes('[compare') || text.includes('[cfg') || text.includes('[denoiser')) {
+    if (text.includes('[')) {
       console.log(`  [browser] ${text}`);
     }
   });

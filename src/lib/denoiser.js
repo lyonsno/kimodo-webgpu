@@ -129,6 +129,7 @@ export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, 
   const motionDim = 369;
 
   const textArr = textEmbedding instanceof Float32Array ? textEmbedding : new Float32Array(textEmbedding);
+  console.log('[denoiser] textArr input[0:5]: ' + JSON.stringify([textArr[0], textArr[1], textArr[2], textArr[3], textArr[4]]));
   const textBuf = createStorageBuffer(device, textArr);
   const zeroTextBuf = createStorageBuffer(device, new Float32Array(textArr.length));
 
