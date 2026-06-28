@@ -164,10 +164,20 @@ export function decodeMotion(features) {
     const feat = features[f].map((v, i) => v * std[i] + mean[i]);
 
     // Unpack
-    const rootPos = feat.slice(slices.smooth_root_pos[0], slices.smooth_root_pos[1]);
+    const smoothRootPos = feat.slice(slices.smooth_root_pos[0], slices.smooth_root_pos[1]);
     const heading = feat.slice(slices.global_root_heading[0], slices.global_root_heading[1]);
     const localJointsFlat = feat.slice(slices.local_joints_positions[0], slices.local_joints_positions[1]);
     const rotDataFlat = feat.slice(slices.global_rot_data[0], slices.global_rot_data[1]);
+
+    // Reconstruct root position from local_joints_positions[root_idx] + smooth root XZ
+    // (matches Python inverse: posed_joints_from_pos[root_idx] after adding smooth XZ)
+    const rootIdx = 0; // Hips
+    const rootJointLocal = localJointsFlat.slice(rootIdx * 3, rootIdx * 3 + 3);
+    const rootPos = [
+      rootJointLocal[0] + smoothRootPos[0],  // X: local offset + smooth
+      rootJointLocal[1],                       // Y: from local positions (not smooth)
+      rootJointLocal[2] + smoothRootPos[2],   // Z: local offset + smooth
+    ];
 
     // Decode rotations: [30, 6] → [30, 3x3]
     const globalRots = [];
