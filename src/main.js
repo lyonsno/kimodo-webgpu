@@ -11,6 +11,7 @@ import { loadWeights } from './lib/weights.js';
 import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
+import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt } from './lib/route-receipt.js';
 
 const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
@@ -18,6 +19,8 @@ const progressBar = document.getElementById('progress-bar');
 const generateBtn = document.getElementById('generate-btn');
 
 let gpuDevice = null;
+let gpuAdapter = null;
+let gpuBackendIdentity = null;
 let modelConfig = null;
 let modelWeights = null;
 let motionRepStats = null;
@@ -25,8 +28,10 @@ let motionRepStats = null;
 async function init() {
   try {
     statusEl.textContent = 'Requesting WebGPU device...';
-    const { device } = await initGPU();
+    const { adapter, device } = await initGPU();
     gpuDevice = device;
+    gpuAdapter = adapter;
+    gpuBackendIdentity = captureBackendIdentity(adapter, device);
     statusEl.textContent = 'WebGPU ready.';
     infoEl.textContent = `GPU: ${(device.limits.maxBufferSize / 1e9).toFixed(1)} GB max buffer`;
 
@@ -104,6 +109,10 @@ async function generate() {
   progressBar.style.width = '0%';
 
   try {
+    // Route receipt profiling
+    const profile = createStagedProfile();
+    profile.start('text-embedding');
+
     // Step 1: Get text embedding from server
     statusEl.textContent = 'Requesting text embedding from server...';
     const embResp = await fetch(`${serverUrl}/embed`, {
@@ -113,7 +122,6 @@ async function generate() {
     });
 
     if (!embResp.ok) {
-      // Fallback: try generate endpoint and explain
       statusEl.textContent = 'Text embedding endpoint not available yet. Need to add /embed to motion-serve.py.';
       infoEl.textContent = 'The /embed endpoint returns just the 4096-dim text vector. Add it to motion-serve.py.';
       return;
@@ -121,10 +129,10 @@ async function generate() {
 
     const embData = await embResp.json();
     const textEmbedding = new Float32Array(embData.embedding);
-    console.log('[kimodo-webgpu] embed received[0:5]: ' + JSON.stringify([textEmbedding[0], textEmbedding[1], textEmbedding[2], textEmbedding[3], textEmbedding[4]]));
-    console.log('[kimodo-webgpu] embed length: ' + textEmbedding.length);
+    profile.end(); // text-embedding
+    profile.start('ddim-sampling');
 
-    // Client-side DDIM loop with server-side denoising steps
+    // Client-side DDIM loop
     statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;
     const t0 = performance.now();
     const motionDim = 369; // root(5) + body(364)
@@ -240,6 +248,8 @@ async function generate() {
     }
 
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
+    profile.end(); // ddim-sampling
+    profile.start('fk-decode');
     statusEl.textContent = `Generated in ${genTime}s — decoding to joints...`;
 
     // Decode motion features to joint positions — entirely client-side!
@@ -248,9 +258,28 @@ async function generate() {
     const decodeTime = ((performance.now() - t1)).toFixed(0);
     console.log(`[kimodo-webgpu] FK decode: ${decodeTime}ms for ${decoded.num_frames} frames`);
 
+    profile.end(); // fk-decode
+    profile.start('output-capture');
+
     progressBar.style.width = '100%';
-    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | fully client-side`;
     renderSkeletonFromJoints(decoded);
+
+    // Emit route receipt
+    const receipt = await createKimodoRouteReceipt({
+      prompt,
+      joints: decoded.joints,
+      motionFeatures: motion,
+      numFrames: decoded.num_frames,
+      numJoints: decoded.num_joints,
+      numSteps,
+      backend: gpuBackendIdentity,
+      profile,
+    });
+    profile.end(); // output-capture
+    console.log('[kimodo-webgpu] Route receipt:', JSON.stringify(receipt.profile));
+    console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
+
+    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | fully client-side`;
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
