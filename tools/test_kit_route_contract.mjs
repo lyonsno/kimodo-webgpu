@@ -6,14 +6,17 @@ import {
   createStagedSubmitProfile,
   createWebGpuBackendIdentity,
   KIMODO_TEXT_TO_MOTION_ROUTE_ID,
+  WEBGPU_INFERENCE_KIT_VERSION,
   validateRouteReceipt,
 } from '@kaminos/webgpu-inference-kit';
+
+assert.equal(WEBGPU_INFERENCE_KIT_VERSION, '0.1.1');
 
 const requiredStages = ['text-embedding', 'ddim-sampling', 'fk-decode', 'output-capture'];
 
 const definition = createKimodoTextToMotionRouteDefinition({
   kernel: {
-    kitVersion: '0.1.0',
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'twostage-denoiser-ddim50-fk',
     commit: 'kimodo-webgpu-kit-contract-smoke',
   },
@@ -78,7 +81,7 @@ const receipt = createKimodoTextToMotionRouteReceipt({
     weightsHash: 'sha256-weights',
   },
   kernel: {
-    kitVersion: '0.1.0',
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     profile: 'twostage-denoiser-ddim50-fk',
     commit: 'kimodo-webgpu-kit-contract-smoke',
   },
