@@ -7,10 +7,14 @@ import {
   createWebGpuBackendIdentity,
   KIMODO_TEXT_TO_MOTION_ROUTE_ID,
   WEBGPU_INFERENCE_KIT_VERSION,
+  WEBGPU_ROUTE_BACKPRESSURE_SCHEMA,
+  WEBGPU_ROUTE_SCHEDULER_SCHEMA,
   validateRouteReceipt,
 } from '@kaminos/webgpu-inference-kit';
 
-assert.match(WEBGPU_INFERENCE_KIT_VERSION, /^0\.1\.\d+$/);
+const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
+assert.deepEqual([kitMajor, kitMinor], [0, 1]);
+assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 
 const requiredStages = ['text-embedding', 'ddim-sampling', 'fk-decode', 'output-capture'];
 
@@ -25,6 +29,25 @@ const definition = createKimodoTextToMotionRouteDefinition({
 assert.equal(KIMODO_TEXT_TO_MOTION_ROUTE_ID, 'kimodo.text-to-motion.webgpu-local.v0');
 assert.equal(definition.routeId, KIMODO_TEXT_TO_MOTION_ROUTE_ID);
 assert.deepEqual(definition.requiredStages, requiredStages);
+assert.equal(definition.scheduler.schema, WEBGPU_ROUTE_SCHEDULER_SCHEMA);
+assert.equal(definition.scheduler.requestedScheduler.mode, 'cooperative');
+assert.equal(definition.backpressure.schema, WEBGPU_ROUTE_BACKPRESSURE_SCHEMA);
+assert.equal(definition.backpressure.effectiveBudget, 'visible-wait');
+assert.deepEqual(
+  definition.scheduler.breathability.spans.map(span => [span.stage, span.kind, span.interruptible]),
+  [
+    ['text-embedding', 'external-bound', false],
+    ['ddim-sampling', 'gpu-submit-loop', false],
+    ['fk-decode', 'cpu-bound', true],
+    ['output-capture', 'readback-bound', false],
+  ],
+);
+assert.ok(
+  definition.scheduler.breathability.checkpoints.some(
+    checkpoint => checkpoint.kind === 'diffusion-step' && checkpoint.afterStage === 'ddim-sampling' && checkpoint.yieldable,
+  ),
+  'Kimodo must expose a yieldable diffusion-step checkpoint',
+);
 assert.deepEqual(
   definition.outputRoles.filter(output => output.required).map(output => output.role),
   ['soma77-joints', 'motion-clip'],
