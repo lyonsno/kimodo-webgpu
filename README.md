@@ -168,7 +168,17 @@ node tools/numerical_comparison.mjs
 
 # Visual filmstrip capture
 node tools/filmstrip_smoke.mjs --prompt "a person walks forward"
+
+# Contract tests — no model, no weights, no GPU required
+python tests/test_embed_server_contract.py    # /embed boundary + bind/CORS
+python tests/test_convert_weights_guard.py    # converter atomicity + guards
 ```
+
+The two contract tests stub the text encoder and run in seconds. They assert
+the failure paths rather than the happy path: that the server binds loopback
+only, that malformed requests get stable 400s, that non-finite or wrong-length
+embeddings are refused rather than served, and that an incompatible sidecar
+config can never leave a rewritten binary behind.
 
 ## What's next
 
