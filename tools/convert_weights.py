@@ -26,9 +26,18 @@ MAX_DIMS = 4
 
 
 def load_safetensors(path: str) -> dict:
-    """Load safetensors file and return state dict."""
-    from safetensors.torch import load_file
-    return load_file(path)
+    """Load safetensors file and return state dict.
+
+    Prefers the numpy loader so weight conversion needs only numpy+safetensors,
+    not a full torch install. Falls back to the torch loader for checkpoints
+    holding dtypes numpy cannot represent (e.g. bfloat16).
+    """
+    try:
+        from safetensors.numpy import load_file
+        return load_file(path)
+    except Exception:
+        from safetensors.torch import load_file
+        return {k: v.numpy() for k, v in load_file(path).items()}
 
 
 def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
@@ -60,7 +69,12 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
 
     for orig_name in sorted(state_dict.keys()):
         tensor = state_dict[orig_name]
-        arr = tensor.detach().float().numpy()
+        # state_dict values are numpy arrays (safetensors.numpy) or torch
+        # tensors (torch fallback); normalize both to float32 numpy.
+        if hasattr(tensor, "detach"):
+            arr = tensor.detach().float().numpy()
+        else:
+            arr = np.asarray(tensor, dtype=np.float32)
 
         # Clean name
         name = orig_name

@@ -40,10 +40,14 @@ model = None
 
 
 def load_text_encoder(device: str):
-    """Load Kimodo and return the model exposing .text_encoder.
+    """Build Kimodo's LLM2Vec text encoder.
 
-    Raises with an actionable message if the Kimodo checkout or weights are
-    missing, since those are the two failure modes a new user will actually hit.
+    Only the text encoder is loaded. The 282M diffusion transformer stays out of
+    memory entirely — the browser owns that half, so loading it here would cost
+    time and RAM for nothing.
+
+    Raises with an actionable message if the Kimodo checkout is missing, since
+    that is the failure mode a new user will actually hit.
     """
     kimodo_root = Path(os.environ.get("KIMODO_ROOT", os.path.expanduser("~/dev/kimodo")))
     if not kimodo_root.is_dir():
@@ -53,8 +57,6 @@ def load_text_encoder(device: str):
         )
 
     sys.path.insert(0, str(kimodo_root))
-    os.environ.setdefault("TEXT_ENCODER_MODE", "local")
-    os.environ.setdefault("CHECKPOINT_DIR", str(kimodo_root / "models"))
 
     import warnings
     import logging
@@ -62,22 +64,28 @@ def load_text_encoder(device: str):
     logging.disable(logging.WARNING)
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 
+    # Kimodo's own "auto" resolves to cuda-or-cpu and never picks mps, which
+    # would silently run an 8B model on CPU here. Set the device explicitly.
+    os.environ["TEXT_ENCODER_DEVICE"] = device
+
     try:
-        from kimodo.model.load_model import load_model
+        from kimodo.model import resolve_target
     except ImportError as e:
         raise SystemExit(
             f"Could not import kimodo from {kimodo_root}: {e}\n"
-            "Check that KIMODO_ROOT points at a Kimodo checkout with its "
-            "dependencies installed."
+            "Install its dependencies (including torch, which Kimodo expects to "
+            "be present already) into the environment running this server."
         )
 
-    loaded, _ = load_model(
-        "kimodo-soma-rp-v1.1",
+    # Mirrors kimodo/scripts/run_text_encoder_server.py's llm2vec preset.
+    encoder_cls = resolve_target("kimodo.model.LLM2VecEncoder")
+    return encoder_cls(
+        base_model_name_or_path="McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp",
+        peft_model_name_or_path="McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised",
+        dtype=os.environ.get("TEXT_ENCODER_DTYPE", "bfloat16"),
+        llm_dim=4096,
         device=device,
-        default_family="Kimodo",
-        return_resolved_name=True,
     )
-    return loaded
 
 
 def resolve_device(requested: str) -> str:
@@ -93,7 +101,9 @@ def resolve_device(requested: str) -> str:
 
 def embed(prompt: str):
     """Return the text embedding for one prompt as a flat list of floats."""
-    text_feat = model.text_encoder([prompt])
+    # LLM2VecEncoder returns (tensor, lengths); a single prompt yields shape
+    # [1, 4096], so the flatten below produces exactly llm_dim floats.
+    text_feat = model([prompt])
     if isinstance(text_feat, tuple):
         text_feat = text_feat[0]
     # Detach torch tensors to numpy. Duck-typed rather than isinstance-checked so

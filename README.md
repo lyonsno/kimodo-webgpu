@@ -89,6 +89,8 @@ Browser (this repo)                        Server (you supply)
 
 ### 1. Convert weights
 
+Conversion needs only numpy and safetensors — no torch.
+
 ```bash
 pip install safetensors numpy
 
