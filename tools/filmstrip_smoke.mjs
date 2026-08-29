@@ -52,46 +52,45 @@ async function main() {
   await page.$eval('#steps', el => { el.value = '50'; });
 
   console.log(`[filmstrip] Generating: "${prompt}"...`);
+  const priorId = await page.evaluate(() => window.__kimodoLastReceipt?.generationId ?? 0);
   await page.click('#generate-btn');
 
-  // One shared terminal-state classifier for both the wait and the verdict.
-  // Previously the wait accepted lowercase "failed" while the verdict check
-  // only looked for "error"/"Error", so an /embed failure satisfied the wait,
-  // fell through the check, and produced a "successful" filmstrip of an empty
-  // pane — a false closure in the evidence harness itself.
-  // Only evidence belonging to THIS generation counts. A prior run leaves both
-  // a canvas and a `real` receipt on the page, which would otherwise satisfy
-  // this wait before the current run produces anything.
-  const terminalState = (expectedId) => {
-    const s = document.getElementById('status')?.textContent || '';
-    const receipt = window.__kimodoLastReceipt;
-    if (receipt && expectedId != null && receipt.generationId !== expectedId) {
-      return { done: false };            // stale evidence from an earlier run
-    }
-    if (/error|failed|unusable|cannot reach|invalid/i.test(s)) {
-      return { done: true, ok: false, status: s };
-    }
-    if (document.querySelector('#viewport canvas') && receipt && receipt.status !== 'in-progress') {
-      return { done: true, ok: receipt.status === 'real', status: s, receipt: receipt.status };
-    }
-    return { done: false };
-  };
+  // Prove the click advanced to a NEW generation; adopting whatever id is
+  // visible after the click would bless a prior run's evidence if the click
+  // regressed to a no-op.
+  let expectedId = null;
+  try {
+    await page.waitForFunction(
+      (prior) => {
+        const id = window.__kimodoLastReceipt?.generationId;
+        return id != null && id !== prior;
+      },
+      { timeout: 15000 },
+      priorId,
+    );
+    expectedId = await page.evaluate(() => window.__kimodoLastReceipt.generationId);
+  } catch {
+    console.log('[filmstrip] FAIL — the click did not start a new generation.');
+    await browser.close();
+    process.exit(1);
+  }
 
-  // The click above started a new generation; its id is the prior id + 1.
-  const expectedId = await page.evaluate(
-    () => (window.__kimodoLastReceipt?.generationId ?? null),
-  );
-
+  // Terminal-state decisions go through the app's shipped classifier — the
+  // same function the app and every other watcher use. A prior revision kept a
+  // local copy here, which drifted from the app and turned a real failure into
+  // a "successful" filmstrip of an empty pane.
   await page.waitForFunction(
-    `(${terminalState.toString()})(${JSON.stringify(expectedId)}).done`,
+    (id) => window.__kimodoGenerationState(id).done,
     { timeout: 300000 },
+    expectedId,
   );
-
-  const verdict = await page.evaluate(
-    `(${terminalState.toString()})(${JSON.stringify(expectedId)})`,
-  );
-  console.log(`[filmstrip] Status: ${verdict.status}`);
-  if (verdict.receipt) console.log(`[filmstrip] Receipt status: ${verdict.receipt}`);
+  const verdict = await page.evaluate((id) => window.__kimodoGenerationState(id), expectedId);
+  const receiptStatus = await page.evaluate(() => window.__kimodoLastReceipt?.status);
+  const statusText = await page
+    .$eval('#status', el => el.textContent)
+    .catch(() => '(status element not present)');
+  console.log(`[filmstrip] Status: ${statusText}`);
+  console.log(`[filmstrip] Receipt status: ${receiptStatus} | classifier ok: ${verdict.ok}`);
 
   if (!verdict.ok) {
     console.log(`[filmstrip] FAIL — generation did not produce a valid result.`);

@@ -11,7 +11,12 @@
  *   node tests/test_route_receipt_contract.mjs
  */
 import { createKimodoRouteReceipt, createStagedProfile } from '../src/lib/route-receipt.js';
-import { validateRouteReceipt } from '@kaminos/webgpu-inference-kit';
+import {
+  validateRouteReceipt,
+  assertAuthoritativeRouteReceipt,
+  WEBGPU_INFERENCE_KIT_VERSION,
+} from '@kaminos/webgpu-inference-kit';
+import { createHash } from 'node:crypto';
 
 const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok, detail });
@@ -101,6 +106,67 @@ for (const [label, over] of bad) {
   const v = validateRouteReceipt(r);
   check('receipt validates against @kaminos/webgpu-inference-kit',
         v.ok === true, (v.errors || []).join('; '));
+}
+
+
+// --- top-level authority must derive from EVERY output, filmstrip included ---
+{
+  let status;
+  try {
+    status = (await receipt({ filmstripData: new Uint8Array(0) })).status;
+  } catch (e) { status = `threw:${e.constructor.name}`; }
+  check('empty filmstrip payload -> top-level not real', status !== 'real', `got ${status}`);
+}
+{
+  // A receipt that is top-level real must survive the kit's AUTHORITATIVE
+  // consumer, not just the permissive structural validator. A prior revision
+  // validated only structurally and shipped receipts the authoritative
+  // consumer rejected.
+  const r = await receipt();
+  let ok = true, detail = '';
+  try { assertAuthoritativeRouteReceipt(r); } catch (e) { ok = false; detail = e.message; }
+  check('real receipt passes assertAuthoritativeRouteReceipt', ok, detail);
+}
+{
+  // Internal consistency: whenever any output is not real, the top level must
+  // not be real either — regardless of which output it is.
+  let consistent = true, detail = '';
+  try {
+    const r = await receipt({ filmstripData: new Uint8Array(0) });
+    const anyBad = r.outputs.some(o => o.status !== 'real');
+    if (anyBad && r.status === 'real') { consistent = false; detail = 'top real over invalid output'; }
+  } catch { /* refusing is fine */ }
+  check('no real top-level over any non-real output', consistent, detail);
+}
+
+// --- hashes must cover exactly the bytes the shape describes ---
+{
+  // Subarray view with sentinel bytes outside the view: the receipt must hash
+  // the 2 view bytes, not the 4 backing-buffer bytes.
+  const backing = new Uint8Array([0xAA, 0x01, 0x02, 0xBB]);
+  const view = backing.subarray(1, 3); // [0x01, 0x02]
+  const expected = createHash('sha256').update(Buffer.from([0x01, 0x02])).digest('hex');
+  let ok = false, detail = '';
+  try {
+    const r = await receipt({ filmstripData: view });
+    const film = r.outputs.find(o => o.role === 'filmstrip');
+    ok = film.sha256 === expected;
+    detail = `got ${film.sha256.slice(0, 12)}.., want ${expected.slice(0, 12)}..`;
+  } catch (e) { detail = e.message; }
+  check('view hash covers only the view bytes', ok, detail);
+}
+
+// --- identity fields must come from the source that knows them ---
+{
+  const r = await receipt();
+  check('kernel.kitVersion matches the installed kit',
+        r.kernel.kitVersion === WEBGPU_INFERENCE_KIT_VERSION,
+        `receipt ${r.kernel.kitVersion}, installed ${WEBGPU_INFERENCE_KIT_VERSION}`);
+}
+{
+  const r = await receipt({ weightsHash: 'abc123def456' });
+  check('explicit weightsHash lands in model.weightsHash',
+        r.model.weightsHash === 'abc123def456', `got ${r.model.weightsHash}`);
 }
 
 const failed = results.filter(r => !r.ok);

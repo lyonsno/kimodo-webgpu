@@ -1,114 +1,115 @@
 /**
- * Generation-freshness tests for the evidence harnesses.
+ * Generation-lifecycle contract tests.
  *
- * An independent review found that window.__kimodoLastReceipt is never cleared
- * when a new generation starts, so after one success the page holds both a
- * canvas and a `real` receipt. A second run's harness can terminate immediately
- * on the FIRST run's evidence, before the second generation produces anything.
+ * Contract: every started generation reaches a terminal state bearing its own
+ * generationId; evidence from one generation can never satisfy a watcher of
+ * another; and ONE shipped classifier decides terminal state for the app, both
+ * harnesses, and these tests.
  *
- * These tests model that page state directly — no browser, no weights, no GPU —
- * by exercising the terminal-state predicate the harnesses use.
+ * A prior revision tested a local re-implementation of this logic and checked
+ * production integration by grepping for tokens — which could not fail when
+ * the real wiring was wrong. These tests import the shipped module directly.
+ * The single remaining source-level check asserts only that both harnesses call
+ * the one exposed choke point (window.__kimodoGenerationState); its behavior is
+ * covered by the module tests here and by the live failure-path probe in
+ * tools/headless_smoke.mjs.
  *
  * Run: node tests/test_generation_identity.mjs
  */
+import {
+  inProgressReceipt,
+  failureReceipt,
+  ensureTerminalReceipt,
+  classifyGenerationState,
+} from '../src/lib/generation-state.js';
+import { readFileSync } from 'node:fs';
+
 const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok, detail });
 
-// Minimal stand-in for the browser globals the harness predicate reads.
-function makePage() {
-  return {
-    canvas: null,
-    receipt: null,
-    status: '',
-    // What generate() must do at the START of a run for freshness to hold.
-    beginGeneration(id) {
-      this.currentGenerationId = id;
-      this.receipt = null;          // required: supersede prior evidence
-      this.status = 'Generating...';
-    },
-    finishGeneration(id, status = 'real') {
-      this.canvas = { id };
-      this.receipt = { status, generationId: id };
-      this.status = `Generated (${id})`;
-    },
-  };
-}
-
-// The predicate under test: what a harness uses to decide a run is done.
-// It must accept only evidence belonging to the generation it is watching.
-function terminalState(page, expectedId) {
-  const s = page.status || '';
-  if (/error|failed|unusable|cannot reach|invalid/i.test(s)) return { done: true, ok: false };
-  const r = page.receipt;
-  if (page.canvas && r) {
-    const belongs = expectedId === undefined || r.generationId === expectedId;
-    if (!belongs) return { done: false };          // stale evidence: keep waiting
-    return { done: true, ok: r.status === 'real' };
-  }
-  return { done: false };
-}
-
-// --- generation A succeeds ---
-const page = makePage();
-page.beginGeneration(1);
-page.finishGeneration(1);
+// --- receipt constructors carry identity and terminality ---
 {
-  const v = terminalState(page, 1);
-  check('generation A completes on its own evidence', v.done && v.ok);
+  const r = inProgressReceipt(7);
+  check('inProgressReceipt carries id + in-progress status',
+        r.generationId === 7 && r.status === 'in-progress' && !!r.createdAt);
 }
-
-// --- generation B starts: stale canvas + stale receipt still present ---
 {
-  const expectedB = 2;
-  page.beginGeneration(expectedB);          // B in flight, no result yet
-  const v = terminalState(page, expectedB);
-  check('generation B does NOT complete on A\'s evidence', !v.done,
-        `done=${v.done} ok=${v.ok}`);
+  const r = failureReceipt(7, 'embedding-unreachable', 'ECONNREFUSED');
+  check('failureReceipt is terminal with phase and reason',
+        r.generationId === 7 && r.status === 'failed'
+        && r.phase === 'embedding-unreachable' && r.reason === 'ECONNREFUSED');
 }
 
-// --- generation B then fails at /embed ---
+// --- ensureTerminalReceipt closes any generation left in-progress ---
 {
-  page.status = 'Text embedding request failed: 500 Internal Server Error.';
-  const v = terminalState(page, 2);
-  check('generation B failure is detected as failure', v.done && !v.ok);
+  const closed = ensureTerminalReceipt(inProgressReceipt(3), 3);
+  check('in-progress for the settled id becomes failed',
+        closed.status === 'failed' && closed.generationId === 3);
 }
-
-// --- generation B succeeds on its own evidence ---
 {
-  page.beginGeneration(2);
-  page.finishGeneration(2);
-  const v = terminalState(page, 2);
-  check('generation B completes on its own evidence', v.done && v.ok);
+  const real = { status: 'real', generationId: 3 };
+  check('a terminal receipt is left unchanged',
+        ensureTerminalReceipt(real, 3) === real);
 }
-
-// --- a receipt from an older generation must never satisfy a newer watcher ---
 {
-  const p2 = makePage();
-  p2.beginGeneration(1); p2.finishGeneration(1);
-  p2.beginGeneration(5);                    // in flight
-  const v = terminalState(p2, 5);
-  check('older receipt never satisfies a newer generation', !v.done);
+  const other = inProgressReceipt(4);
+  check('another generation\'s receipt is left unchanged',
+        ensureTerminalReceipt(other, 3) === other);
+}
+{
+  check('null receipt handled without throwing',
+        ensureTerminalReceipt(null, 3) === null);
 }
 
-// --- the real module must expose the same discipline ---
-// generate() must clear the exposed receipt before awaiting anything.
-import { readFileSync } from 'node:fs';
+// --- the classifier: what a harness may accept ---
+const S = (receipt, expectedId, canvasPresent = true) =>
+  classifyGenerationState({ receipt, expectedId, canvasPresent });
+{
+  check('no receipt -> not done', !S(null, 1).done);
+  check('stale generation -> not done',
+        !S({ status: 'real', generationId: 1 }, 2).done);
+  check('null expectedId -> not done (never universally fresh)',
+        !S({ status: 'real', generationId: 1 }, null).done);
+  check('in-progress -> not done',
+        !S(inProgressReceipt(1), 1).done);
+  const f = S(failureReceipt(1, 'embedding-http', '503'), 1);
+  check('failed -> done, not ok, phase surfaced',
+        f.done && !f.ok && f.phase === 'embedding-http');
+  const inv = S({ status: 'invalid', generationId: 1, fallbackReason: 'joints: empty' }, 1);
+  check('invalid -> done, not ok', inv.done && !inv.ok);
+  check('real without canvas -> not done yet',
+        !S({ status: 'real', generationId: 1 }, 1, false).done);
+  const ok = S({ status: 'real', generationId: 1 }, 1, true);
+  check('real with canvas -> done, ok', ok.done && ok.ok);
+  const unk = S({ status: 'banana', generationId: 1 }, 1);
+  check('unknown status -> done, not ok (fail loud, not hang)', unk.done && !unk.ok);
+}
+
+// --- production wiring uses the shipped module through one choke point ---
 const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-// Strip comments before locating the first await — otherwise prose mentioning
-// "await" is mistaken for code (this test's own earlier false positive).
 const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-const genBody = stripComments(mainSrc.slice(mainSrc.indexOf('async function generate()')));
-const clearIdx = genBody.search(/__kimodoLastReceipt\s*=\s*(null|undefined|\{)/);
-const firstAwait = genBody.search(/\bawait\s/);
-check('generate() supersedes the exposed receipt before its first await',
-      clearIdx !== -1 && clearIdx < firstAwait,
-      clearIdx === -1 ? 'no reset of __kimodoLastReceipt found' : `reset at ${clearIdx}, first await at ${firstAwait}`);
-check('generate() stamps a generation id onto the receipt',
-      /generationId/.test(mainSrc), 'no generationId in src/main.js');
-check('harnesses compare a generation id',
-      /generationId/.test(readFileSync(new URL('../tools/headless_smoke.mjs', import.meta.url), 'utf8')) &&
-      /generationId/.test(readFileSync(new URL('../tools/filmstrip_smoke.mjs', import.meta.url), 'utf8')),
-      'harnesses do not check generationId');
+{
+  check('main.js imports the shipped generation-state module',
+        /from '\.\/lib\/generation-state\.js'/.test(mainSrc));
+  check('main.js exposes the classifier choke point',
+        /__kimodoGenerationState\s*=/.test(mainSrc));
+  const genBody = stripComments(mainSrc.slice(mainSrc.indexOf('async function generate()')));
+  const publishIdx = genBody.search(/__kimodoLastReceipt\s*=\s*inProgressReceipt\(/);
+  const firstAwait = genBody.search(/\bawait\s/);
+  check('generate() publishes an in-progress receipt before its first await',
+        publishIdx !== -1 && publishIdx < firstAwait,
+        publishIdx === -1 ? 'inProgressReceipt not used' : `publish at ${publishIdx}, first await at ${firstAwait}`);
+  check('generate() has a terminal backstop (finally + ensureTerminalReceipt)',
+        /finally\s*\{[\s\S]*?ensureTerminalReceipt/.test(genBody),
+        'no finally-guard found');
+}
+for (const tool of ['headless_smoke.mjs', 'filmstrip_smoke.mjs']) {
+  const src = readFileSync(new URL(`../tools/${tool}`, import.meta.url), 'utf8');
+  check(`${tool} calls the shipped classifier choke point`,
+        /__kimodoGenerationState\(/.test(src), 'no call found');
+  check(`${tool} captures the prior generation id before clicking`,
+        /prior(Generation)?Id/.test(src), 'no prior-id capture found');
+}
 
 const failed = results.filter(r => !r.ok);
 for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${!r.ok && r.detail ? `   [${r.detail}]` : ''}`);

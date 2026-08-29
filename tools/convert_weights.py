@@ -231,12 +231,40 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     config_path = output_path.with_suffix(".json")
     check_existing_config(config_path, config)
 
-    # Serialize to a sibling temp file and atomically replace the destination.
-    # Writing directly truncates an existing 540 MB artifact before the
-    # replacement is known complete, so a disk-full error, I/O failure, or
-    # interruption destroys a working binary.
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    # --- Publication transaction for the binary/config PAIR ---
+    #
+    # The unit of consumption is the pair: the browser fetches kimodo.bin and
+    # kimodo.json together, so atomicity must cover both, not each file alone.
+    #
+    # Discipline:
+    #  * Every artifact is staged to a UNIQUE per-run temp file (pid+token) and
+    #    fsynced before any publication. Fixed temp names let two concurrent
+    #    conversions share an inode, allowing a failed run to mutate the
+    #    already-published destination in place.
+    #  * The config (when absent) is published BEFORE the binary. build_config
+    #    is deterministic per dtype, so a config-without-binary intermediate is
+    #    self-healing: the next run finds it compatible and publishes only the
+    #    binary. A binary-without-config intermediate is a broken install.
+    #  * If binary publication fails after config publication, the config is
+    #    rolled back to its prior state (removed, since it did not exist).
+    #  * Cleanup removes only this run's own temps; foreign temp files are
+    #    never touched.
+    import secrets
+    run_tag = f"{os.getpid()}.{secrets.token_hex(4)}"
+    tmp_path = output_path.parent / f"{output_path.name}.{run_tag}.tmp"
+    config_missing = not config_path.exists()
+    cfg_tmp = config_path.parent / f"{config_path.name}.{run_tag}.tmp" if config_missing else None
+
+    def _cleanup_own_temps():
+        for t in (tmp_path, cfg_tmp):
+            if t is not None:
+                try:
+                    t.unlink()
+                except OSError:
+                    pass
+
     try:
+        # Stage the binary.
         with open(tmp_path, "wb") as f:
             f.write(MAGIC)
             f.write(struct.pack("<I", VERSION))
@@ -261,14 +289,28 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
             f.flush()
             os.fsync(f.fileno())
 
-        # Only now is the payload known complete on disk.
-        os.replace(tmp_path, output_path)
-    except BaseException:
-        # Leave the existing destination untouched on any failure.
+        # Stage the config (fresh installs only) before publishing ANYTHING.
+        if config_missing:
+            with open(cfg_tmp, "w") as f:
+                json.dump(config, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+        # Publish: config first (self-healing intermediate), then binary.
+        if config_missing:
+            os.replace(cfg_tmp, config_path)
         try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            if config_missing:
+                # Roll the config back to its prior state (absent).
+                try:
+                    config_path.unlink()
+                except OSError:
+                    pass
+            raise
+    except BaseException:
+        _cleanup_own_temps()
         raise
 
     total_mb = len(weight_data) / (1024 * 1024)
@@ -276,23 +318,7 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     print(f"  Tensors: {num_tensors}")
     print(f"  Size: {total_mb:.1f} MB ({dtype})")
     print(f"  Header: {header_size} bytes")
-
-    # Config was validated before the binary was written; publish it now,
-    # through the same temp-and-replace discipline.
-    if not config_path.exists():
-        cfg_tmp = config_path.with_suffix(config_path.suffix + ".tmp")
-        try:
-            with open(cfg_tmp, "w") as f:
-                json.dump(config, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(cfg_tmp, config_path)
-        except BaseException:
-            try:
-                cfg_tmp.unlink()
-            except OSError:
-                pass
-            raise
+    if config_missing:
         print(f"Config written to {config_path}")
     else:
         print(f"Config already present and matching: {config_path}")

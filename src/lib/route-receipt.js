@@ -11,10 +11,11 @@
  * - Profile: staged timing for text-embedding, ddim-sampling, fk-decode, output-capture
  */
 
+import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+
 const ROUTE_ID = 'kimodo.text-to-motion.webgpu-local.v0';
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
 const MOTION_FEATURE_DIM = 369;
-const KIT_VERSION = '0.1.1';
 // The kit requires a non-empty weights identity. Callers that have not hashed
 // the weight binary pass this sentinel rather than an empty string, so the
 // receipt stays schema-valid while remaining honest about what is unknown.
@@ -72,9 +73,17 @@ export function setTextEmbeddingEndpoint(backend, endpoint, device = 'unknown') 
  * SHA-256 hash of a string or typed array.
  */
 async function sha256(data) {
+  // A typed-array VIEW must be hashed over exactly its own bytes. Wrapping
+  // `data.buffer` ignores byteOffset/byteLength, so a subarray previously
+  // hashed its whole backing buffer while the receipt reported the view's
+  // shape — the hash did not identify the artifact the shape described.
   const buffer = typeof data === 'string'
     ? new TextEncoder().encode(data)
-    : (data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data));
+    : data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data);
   const hash = await crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -230,15 +239,21 @@ export async function createKimodoRouteReceipt({
 
   const finishedProfile = profile.finish();
 
+  // Top-level authority derives from EVERY emitted output, optional ones
+  // included. A receipt that says `real` while carrying an invalid output is
+  // internally contradictory: the kit's authoritative consumer rejects it,
+  // while a naive consumer reading only the top level would accept it.
+  const invalidReasons = outputs
+    .filter((o) => o.status !== 'real')
+    .map((o) => `${o.role}: ${o.invalidReason ?? 'invalid'}`);
+  const allOutputsValid = invalidReasons.length === 0;
+
   return {
     schema: 'kaminos.webgpu-route-receipt.v0',
     requestedRouteId: ROUTE_ID,
     effectiveRouteId: ROUTE_ID,
-    status: outputsValid ? 'real' : 'invalid',
-    fallbackReason: outputsValid
-      ? null
-      : [jointsError && `joints: ${jointsError}`, motionError && `motion: ${motionError}`]
-          .filter(Boolean).join('; '),
+    status: allOutputsValid ? 'real' : 'invalid',
+    fallbackReason: allOutputsValid ? null : invalidReasons.join('; '),
     // `createdAt` is the kit's freshness-bearing field; `timestamp` is retained
     // for existing readers.
     createdAt: new Date().toISOString(),
@@ -257,7 +272,9 @@ export async function createKimodoRouteReceipt({
       weightsHash,
     },
     kernel: {
-      kitVersion: KIT_VERSION,
+      // From the installed package: a duplicated constant here previously
+      // reported 0.1.1 while the installed kit was 0.1.4.
+      kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
       profile: 'kimodo-text-to-motion',
     },
     inputs: [{

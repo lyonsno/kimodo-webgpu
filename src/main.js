@@ -12,6 +12,17 @@ import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from '.
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
 import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
+import { inProgressReceipt, failureReceipt, ensureTerminalReceipt, classifyGenerationState } from './lib/generation-state.js';
+
+// The single choke point every watcher (smoke harnesses, live probes) uses to
+// decide whether the generation it is watching has terminally settled. Keeping
+// exactly one classifier prevents the harness/app drift that previously turned
+// a real failure status into a silent timeout.
+window.__kimodoGenerationState = (expectedId) => classifyGenerationState({
+  receipt: window.__kimodoLastReceipt ?? null,
+  expectedId,
+  canvasPresent: !!document.querySelector('#viewport canvas'),
+});
 
 const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
@@ -72,6 +83,15 @@ async function init() {
     }
 
     const downloadTime = ((performance.now() - t0) / 1000).toFixed(1);
+
+    // Identity of the weights actually consumed, from the bytes themselves.
+    // Computed once per load, in the background; the receipt awaits it. A
+    // receipt carrying a placeholder here cannot say WHICH model produced an
+    // output, so the hash comes from the loaded buffer, not from provenance.
+    weightsHashPromise = crypto.subtle.digest('SHA-256', buffer).then(
+      (h) => [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join(''),
+    );
+
     statusEl.textContent = `Parsing weights and creating GPU buffers...`;
 
     // Parse and upload to GPU
@@ -95,6 +115,7 @@ async function init() {
 }
 
 let generationCounter = 0;
+let weightsHashPromise = null;
 
 async function generate() {
   if (!modelWeights || !gpuDevice) return;
@@ -107,11 +128,7 @@ async function generate() {
   // receipt are still on the page when a harness installs its wait, letting
   // run N+1 be certified by run N's result.
   const generationId = ++generationCounter;
-  window.__kimodoLastReceipt = {
-    status: 'in-progress',
-    generationId,
-    createdAt: new Date().toISOString(),
-  };
+  window.__kimodoLastReceipt = inProgressReceipt(generationId);
 
   const duration = parseFloat(document.getElementById('duration').value) || 6;
   const numSteps = parseInt(document.getElementById('steps').value) || 100;
@@ -141,6 +158,7 @@ async function generate() {
         body: JSON.stringify({ prompt }),
       });
     } catch (netErr) {
+      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-unreachable', netErr.message);
       statusEl.textContent = `Cannot reach the text embedding server at ${serverUrl}.`;
       infoEl.textContent =
         'This route requires an external /embed endpoint returning a 4096-float ' +
@@ -150,6 +168,7 @@ async function generate() {
     }
 
     if (!embResp.ok) {
+      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-http', `${embResp.status} ${embResp.statusText}`);
       statusEl.textContent = `Text embedding request failed: ${embResp.status} ${embResp.statusText}.`;
       infoEl.textContent =
         `POST ${serverUrl}/embed must accept {"prompt": "..."} and return ` +
@@ -175,6 +194,7 @@ async function generate() {
       }
     }
     if (embError) {
+      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-unusable', embError);
       statusEl.textContent = 'Text embedding server returned an unusable embedding.';
       infoEl.textContent =
         `${embError}. Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B ` +
@@ -329,6 +349,7 @@ async function generate() {
       backend: setTextEmbeddingEndpoint(gpuBackendIdentity, `${serverUrl}/embed`),
       profile,
       generationId,
+      weightsHash: weightsHashPromise ? await weightsHashPromise : undefined,
     });
     profile.end(); // output-capture
     // Expose the structured receipt so harnesses can inspect an object rather
@@ -349,116 +370,18 @@ async function generate() {
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
+    window.__kimodoLastReceipt = failureReceipt(generationId, 'exception', err.message);
     statusEl.textContent = `Error: ${err.message}`;
     console.error(err);
   } finally {
+    // Structural backstop: no started generation may settle while still
+    // in-progress, whatever path led here. Individual failure paths above give
+    // better phases; this guard makes forgetting one impossible to ship.
+    window.__kimodoLastReceipt = ensureTerminalReceipt(window.__kimodoLastReceipt, generationId);
     generateBtn.disabled = false;
   }
 }
 window.generate = generate;
-
-// ---------- Skeleton / output visualization ----------
-
-let animFrameId = null;
-
-function renderSkeleton(result) {
-  const viewport = document.getElementById('viewport');
-
-  // Remove old status text
-  const oldStatus = viewport.querySelector('#status');
-  if (oldStatus) oldStatus.remove();
-
-  // Create or reuse canvas
-  let canvas = viewport.querySelector('canvas');
-  if (!canvas) {
-    canvas = document.createElement('canvas');
-    viewport.appendChild(canvas);
-  }
-  canvas.width = viewport.clientWidth;
-  canvas.height = viewport.clientHeight;
-  const ctx = canvas.getContext('2d');
-
-  const { bodyResult, rootResult, numFrames, fps } = result;
-  const bodyDim = modelConfig.body_output_dim; // 364
-  const rootDim = modelConfig.root_output_dim; // 5
-
-  // Display output stats
-  let bodyMin = Infinity, bodyMax = -Infinity, bodySum = 0;
-  for (let i = 0; i < bodyResult.length; i++) {
-    const v = bodyResult[i];
-    if (v < bodyMin) bodyMin = v;
-    if (v > bodyMax) bodyMax = v;
-    bodySum += v;
-  }
-  const bodyMean = bodySum / bodyResult.length;
-
-  infoEl.textContent += ` | body: [${bodyMin.toFixed(2)}, ${bodyMax.toFixed(2)}] mean=${bodyMean.toFixed(4)}`;
-  console.log('[kimodo-webgpu] Body output stats:', { min: bodyMin, max: bodyMax, mean: bodyMean, len: bodyResult.length });
-  console.log('[kimodo-webgpu] Root output stats:', { len: rootResult.length });
-  console.log('[kimodo-webgpu] First 10 body values:', Array.from(bodyResult.slice(0, 10)));
-  console.log('[kimodo-webgpu] First 10 root values:', Array.from(rootResult.slice(0, 10)));
-
-  // Animate: render a heatmap of body features over time
-  let frame = 0;
-  if (animFrameId) cancelAnimationFrame(animFrameId);
-
-  function drawFrame() {
-    const W = canvas.width;
-    const H = canvas.height;
-    ctx.fillStyle = '#1a1a1a';
-    ctx.fillRect(0, 0, W, H);
-
-    // Draw feature heatmap for current frame
-    const offset = frame * bodyDim;
-    const barW = W / bodyDim;
-    for (let i = 0; i < bodyDim; i++) {
-      const v = bodyResult[offset + i];
-      // Map value to color: negative=blue, zero=black, positive=orange
-      const intensity = Math.min(1, Math.abs(v) / 2);
-      if (v > 0) {
-        ctx.fillStyle = `rgba(255, 140, 0, ${intensity})`;
-      } else {
-        ctx.fillStyle = `rgba(30, 144, 255, ${intensity})`;
-      }
-      ctx.fillRect(i * barW, H * 0.1, barW + 1, H * 0.3);
-    }
-
-    // Draw root trajectory (x, z) up to current frame
-    const rootScale = 50;
-    const cx = W / 2;
-    const cy = H * 0.7;
-    ctx.strokeStyle = '#ff8800';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let f = 0; f <= frame; f++) {
-      const rOff = f * rootDim;
-      const x = cx + (rootResult[rOff] || 0) * rootScale;
-      const z = cy - (rootResult[rOff + 2] || 0) * rootScale;
-      if (f === 0) ctx.moveTo(x, z); else ctx.lineTo(x, z);
-    }
-    ctx.stroke();
-
-    // Current position dot
-    const rOff = frame * rootDim;
-    const dotX = cx + (rootResult[rOff] || 0) * rootScale;
-    const dotZ = cy - (rootResult[rOff + 2] || 0) * rootScale;
-    ctx.fillStyle = '#ff6600';
-    ctx.beginPath();
-    ctx.arc(dotX, dotZ, 5, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Frame counter
-    ctx.fillStyle = '#888';
-    ctx.font = '12px monospace';
-    ctx.fillText(`Frame ${frame}/${numFrames}  |  Body dim: ${bodyDim}  |  Root dim: ${rootDim}`, 10, H - 10);
-    ctx.fillText(`Top: feature heatmap (blue=neg, orange=pos)  |  Bottom: root trajectory (x,z)`, 10, H - 26);
-
-    frame = (frame + 1) % numFrames;
-    animFrameId = requestAnimationFrame(drawFrame);
-  }
-
-  drawFrame();
-}
 
 // ---------- Skeleton rendering from decoded joint positions ----------
 

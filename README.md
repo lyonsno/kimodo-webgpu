@@ -151,11 +151,12 @@ Open the URL, type a prompt, click Generate. Weights download on first load (~54
 | Check | Status | Tool |
 |-------|--------|------|
 | Forward pass vs PyTorch | ✅ Max diff 0.000645 | `node tools/numerical_comparison.mjs` |
-| DDIM loop correctness | ✅ No material findings | Independent Aposkepsis review |
-| Full implementation review | ✅ 21 questions, no material findings | Independent Aposkepsis review |
-| FK decode review | ✅ 1 finding fixed | Independent Aposkepsis review |
+| DDIM loop correctness | ✅ No material findings | Independent fresh-context review |
+| Full implementation review | ✅ 21 questions, no material findings | Independent fresh-context review |
+| FK decode review | ✅ 1 finding fixed | Independent fresh-context review |
 | Visual output coherence | ✅ Operator confirmed | Headless smoke + filmstrip witness |
-| Route receipt emission | ✅ Staged profile + artifact hashes | `@kaminos/webgpu-inference-kit` contract |
+| Route receipt emission | ✅ Kit-authoritative receipt: staged profile, output hashes, weights identity (SHA-256 of the loaded binary) | Asserted live against `validateRouteReceipt` + `assertAuthoritativeRouteReceipt` |
+| Failure-path behavior | ✅ Dead endpoint yields a terminal `failed` receipt, not a timeout | Live probe in `tools/headless_smoke.mjs` |
 
 ## Automated tests
 
@@ -171,7 +172,9 @@ node tools/filmstrip_smoke.mjs --prompt "a person walks forward"
 
 # Contract tests — no model, no weights, no GPU required
 python tests/test_embed_server_contract.py    # /embed boundary + bind/CORS
-python tests/test_convert_weights_guard.py    # converter atomicity + guards
+python tests/test_convert_weights_guard.py    # converter pair-atomicity, concurrency, config guards
+node tests/test_route_receipt_contract.mjs    # receipt validity, authority, hashing, kit contract
+node tests/test_generation_identity.mjs       # generation lifecycle + terminal-state classifier
 ```
 
 The two contract tests stub the text encoder and run in seconds. They assert

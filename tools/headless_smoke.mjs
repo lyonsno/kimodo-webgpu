@@ -15,6 +15,27 @@
  */
 
 import puppeteer from 'puppeteer-core';
+import {
+  validateRouteReceipt,
+  assertAuthoritativeRouteReceipt,
+} from '@kaminos/webgpu-inference-kit';
+
+/** Wait until a generation newer than priorId is visibly in flight; null if none appears. */
+async function waitForNewGeneration(page, priorId, timeoutMs = 15000) {
+  try {
+    await page.waitForFunction(
+      (prior) => {
+        const id = window.__kimodoLastReceipt?.generationId;
+        return id != null && id !== prior;
+      },
+      { timeout: timeoutMs },
+      priorId,
+    );
+  } catch {
+    return null;
+  }
+  return page.evaluate(() => window.__kimodoLastReceipt.generationId);
+}
 
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const DEFAULT_URL = 'http://localhost:5175';
@@ -81,35 +102,32 @@ async function main() {
   await page.$eval('#steps', el => { el.value = '100'; });
 
   console.log(`[smoke] Triggering generation...`);
+  const priorId = await page.evaluate(() => window.__kimodoLastReceipt?.generationId ?? 0);
   await page.click('#generate-btn');
 
-  // Wait for the rendered canvas, not for status text. #status is moved out of
-  // the viewport on success, so polling it for "Generated" times out on a
-  // working route — a false negative that made success look like failure.
-  // The click started a new generation; only its own receipt may satisfy this
-  // wait. A prior run's canvas and `real` receipt persist on the page and would
-  // otherwise terminate the wait before this run produced anything.
-  const expectedId = await page.evaluate(
-    () => (window.__kimodoLastReceipt?.generationId ?? null),
-  );
+  // Prove the click actually advanced to a NEW generation before watching for
+  // its outcome. Sampling whatever id is visible after the click would adopt a
+  // prior run's id if the click regressed to a no-op — and then bless exactly
+  // the stale evidence the freshness check exists to reject.
+  const expectedId = await waitForNewGeneration(page, priorId);
+  if (expectedId === null) {
+    console.log('[smoke] FAIL — the click did not start a new generation.');
+    await browser.close();
+    process.exit(1);
+  }
 
   let timedOut = false;
   try {
+    // Terminal-state decisions go through the app's shipped classifier — the
+    // same one the app and every other watcher use — never a local copy.
     await page.waitForFunction(
-      (wantId) => {
-        const r = window.__kimodoLastReceipt;
-        if (r && wantId != null && r.generationId !== wantId) return false;
-        const s = document.getElementById('status')?.textContent || '';
-        if (s.includes('Error') || s.includes('failed') || s.includes('unusable')) return true;
-        return !!document.querySelector('#viewport canvas')
-          && !!r && r.status !== 'in-progress';
-      },
+      (id) => window.__kimodoGenerationState(id).done,
       { timeout: 120000 },
       expectedId,
     );
   } catch {
     timedOut = true;
-    console.log(`[smoke] Generation timed out — no canvas and no error status.`);
+    console.log(`[smoke] Generation timed out — classifier never reached a terminal state.`);
   }
 
   const finalStatus = await page.$eval('#status', el => el.textContent).catch(() => 'unknown');
@@ -132,33 +150,65 @@ async function main() {
   // inert and a NaN-producing run passed cleanly.
   const receipt = await page.evaluate(() => window.__kimodoLastReceipt ?? null);
 
-  const hasReceipt = receipt !== null;
-  const receiptFresh = hasReceipt && (expectedId == null || receipt.generationId === expectedId);
-  const receiptReal = hasReceipt && receipt.status === 'real';
-  const canvasPresent = await page.$('#viewport canvas') !== null;
-  const invalidOutputs = hasReceipt
-    ? (receipt.outputs || []).filter(o => o.status !== 'real')
-    : [];
+  const verdict = timedOut
+    ? { done: false, ok: false }
+    : await page.evaluate((id) => window.__kimodoGenerationState(id), expectedId);
 
-  const failed = timedOut || !hasReceipt || !receiptFresh || !receiptReal
-    || invalidOutputs.length > 0 || !canvasPresent;
-  console.log(`\n[smoke] === Result ===`);
-  console.log(`  Route receipt present: ${hasReceipt}`);
-  console.log(`  Receipt belongs to this generation: ${receiptFresh}`);
-  console.log(`  Receipt status: ${hasReceipt ? receipt.status : 'n/a'}`);
-  console.log(`  Invalid outputs: ${invalidOutputs.length}`);
-  console.log(`  Canvas rendered: ${canvasPresent}`);
-  console.log(`  Timed out: ${timedOut}`);
-  console.log(`  Status: ${failed ? 'FAIL' : 'PASS'}`);
-  if (failed) {
-    if (timedOut) console.log(`    reason: no terminal state reached`);
-    if (!hasReceipt) console.log(`    reason: no route receipt — generation did not run`);
-    else if (!receiptFresh) console.log(`    reason: receipt is from generation ${receipt.generationId}, expected ${expectedId}`);
-    else if (!receiptReal) console.log(`    reason: receipt status "${receipt.status}" — ${receipt.fallbackReason}`);
-    for (const o of invalidOutputs) console.log(`    reason: output ${o.role} invalid — ${o.invalidReason}`);
-    if (!canvasPresent) console.log(`    reason: no rendered canvas`);
+  // The receipt must satisfy the kit contract at the authority level it
+  // claims — the authoritative consumer, not only the structural validator —
+  // and must identify the actual weights, not a placeholder.
+  let kitOk = false, kitDetail = '';
+  let weightsIdentified = false;
+  if (receipt && receipt.status === 'real') {
+    const v = validateRouteReceipt(receipt);
+    if (!v.ok) kitDetail = v.errors.join('; ');
+    else {
+      try { assertAuthoritativeRouteReceipt(receipt); kitOk = true; }
+      catch (e) { kitDetail = e.message; }
+    }
+    weightsIdentified = /^[0-9a-f]{64}$/.test(receipt?.model?.weightsHash ?? '');
   }
 
+  const positivePassed = !timedOut && verdict.done && verdict.ok
+    && kitOk && weightsIdentified;
+  console.log(`\n[smoke] === Positive result ===`);
+  console.log(`  Classifier verdict: done=${verdict.done} ok=${verdict.ok}`);
+  console.log(`  Kit-authoritative receipt: ${kitOk}${kitDetail ? ` (${kitDetail})` : ''}`);
+  console.log(`  Weights identified (sha256): ${weightsIdentified}`);
+  console.log(`  Timed out: ${timedOut}`);
+  console.log(`  Status: ${positivePassed ? 'PASS' : 'FAIL'}`);
+
+  // Failure-path probe: point the app at a dead endpoint and require a
+  // terminal FAILED receipt for a NEW generation. This exercises, live, the
+  // path a prior harness revision turned into a 120-second silent timeout.
+  console.log(`\n[smoke] === Failure-path probe ===`);
+  await page.$eval('#server-url', (el) => { el.value = 'http://127.0.0.1:9'; });
+  const probePrior = await page.evaluate(() => window.__kimodoLastReceipt?.generationId ?? 0);
+  await page.click('#generate-btn');
+  const probeId = await waitForNewGeneration(page, probePrior);
+  let probePassed = false;
+  if (probeId === null) {
+    console.log('  FAIL — probe click did not start a new generation.');
+  } else {
+    try {
+      await page.waitForFunction(
+        (id) => window.__kimodoGenerationState(id).done,
+        { timeout: 30000 },
+        probeId,
+      );
+      const pv = await page.evaluate((id) => window.__kimodoGenerationState(id), probeId);
+      const pr = await page.evaluate(() => window.__kimodoLastReceipt);
+      probePassed = pv.done && pv.ok === false && pr.status === 'failed'
+        && pr.generationId === probeId && !!pr.phase;
+      console.log(`  Terminal: done=${pv.done} ok=${pv.ok} status=${pr.status} phase=${pr.phase ?? 'n/a'}`);
+    } catch {
+      console.log('  FAIL — dead endpoint produced no terminal state (silent timeout).');
+    }
+  }
+  console.log(`  Status: ${probePassed ? 'PASS' : 'FAIL'}`);
+
+  const failed = !positivePassed || !probePassed;
+  console.log(`\n[smoke] === Overall: ${failed ? 'FAIL' : 'PASS'} ===`);
   await browser.close();
   process.exit(failed ? 1 : 0);
 }
