@@ -11,7 +11,7 @@
  * Requires:
  *   - Chrome installed at /Applications/Google Chrome.app
  *   - Vite dev server running (npm run dev)
- *   - Motion server running for /embed endpoint (motion-serve.py)
+ *   - Text embedding server running (python tools/embed_server.py --port 8098)
  */
 
 import puppeteer from 'puppeteer-core';

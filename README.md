@@ -103,28 +103,26 @@ python tools/convert_weights.py \
 
 ### 2. Provide a text embedding endpoint
 
-**This is an external prerequisite and it is not shipped in this repository.** Generation will not work until you supply it.
+The browser cannot compute one thing: the 4096-dimension text embedding from Kimodo's LLM2Vec/Llama 3 8B encoder. `tools/embed_server.py` serves exactly that and nothing else.
 
-The browser needs one thing it cannot compute itself: a 4096-dimension text embedding from Kimodo's LLM2Vec/Llama 3 8B text encoder. The app POSTs to `/embed` on a server you run:
+```bash
+# Requires a Kimodo checkout (https://github.com/nv-tlabs/kimodo) and its weights:
+#   huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.1
+export KIMODO_ROOT=~/dev/kimodo          # default, override if elsewhere
 
-```
-POST <server-url>/embed
-Content-Type: application/json
-
-{ "prompt": "a person walks forward and waves" }
-```
-
-Expected response:
-
-```json
-{ "embedding": [ ...4096 floats... ], "dim": 4096, "shape": [1, 4096] }
+python tools/embed_server.py --port 8098
 ```
 
-Point the app at your server with the **Server URL** field in the UI (default `http://localhost:8098`).
+The server loads the encoder (~16 GB) at startup and **exits non-zero if that fails**, so a running server means a working route. Point the app at it with the **Server URL** field in the UI (default `http://localhost:8098`).
 
-Any server satisfying that contract works. The reference implementation is `motion-serve.py`, part of the Kaminos research workbench; it is **not currently published**, so treat it as a contract to implement rather than a file to download. To build your own, load `Kimodo-SOMA-RP-v1.1` and return `model.text_encoder([prompt])` flattened to a list — roughly 25 lines around whichever HTTP framework you prefer. Expect ~16 GB of memory for the encoder.
+Any server satisfying this contract works if you prefer your own:
 
-If the endpoint is missing or unreachable, the app fails loud: it reports the unavailable endpoint in the status line and stops rather than silently producing garbage motion.
+```
+POST <server-url>/embed        { "prompt": "a person walks forward and waves" }
+->  200                        { "embedding": [ ...4096 floats... ], "dim": 4096, "shape": [1, 4096] }
+```
+
+If the endpoint is missing, unreachable, or returns the wrong number of floats, the app fails loud — it reports the problem in the status line and stops, rather than feeding a bad embedding into diffusion and producing plausible-looking nonsense.
 
 ### 3. Run
 
@@ -149,7 +147,7 @@ Open the URL, type a prompt, click Generate. Weights download on first load (~54
 ## Automated tests
 
 ```bash
-# Headless smoke test (requires Chrome + running servers)
+# Headless smoke test (requires Chrome, npm run dev, and tools/embed_server.py)
 node tools/headless_smoke.mjs
 
 # Numerical comparison against PyTorch reference
