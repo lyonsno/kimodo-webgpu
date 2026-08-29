@@ -425,8 +425,15 @@ let skelAnimId = null;
 
 function renderSkeletonFromJoints(decoded) {
   const viewport = document.getElementById('viewport');
+  // Move #status out of the viewport rather than removing it. Deleting it here
+  // destroyed the element at the exact moment of success, so any harness
+  // polling #status for "Generated" waited forever on a working route and
+  // reported a timeout — success was indistinguishable from failure.
   const oldStatus = viewport.querySelector('#status');
-  if (oldStatus) oldStatus.remove();
+  if (oldStatus) {
+    oldStatus.style.display = 'none';
+    document.body.appendChild(oldStatus);
+  }
 
   let canvas = viewport.querySelector('canvas');
   if (!canvas) {

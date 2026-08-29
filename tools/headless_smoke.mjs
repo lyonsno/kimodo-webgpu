@@ -83,17 +83,22 @@ async function main() {
   console.log(`[smoke] Triggering generation...`);
   await page.click('#generate-btn');
 
-  // Wait for generation to complete
+  // Wait for the rendered canvas, not for status text. #status is moved out of
+  // the viewport on success, so polling it for "Generated" times out on a
+  // working route — a false negative that made success look like failure.
+  let timedOut = false;
   try {
     await page.waitForFunction(
       () => {
+        if (document.querySelector('#viewport canvas')) return true;
         const s = document.getElementById('status')?.textContent || '';
-        return s.includes('Generated') || s.includes('Error');
+        return s.includes('Error') || s.includes('failed');
       },
       { timeout: 120000 },
     );
   } catch {
-    console.log(`[smoke] Generation timed out.`);
+    timedOut = true;
+    console.log(`[smoke] Generation timed out — no canvas and no error status.`);
   }
 
   const finalStatus = await page.$eval('#status', el => el.textContent).catch(() => 'unknown');
@@ -114,13 +119,25 @@ async function main() {
   const hasBodyNaN = logs.some(l => l.text.includes('Body output') && l.text.includes('NaN'));
   const hasRootNaN = logs.some(l => l.text.includes('Root output') && l.text.includes('NaN'));
 
+  // A receipt proves the route ran; absence of NaN alone does not, since a
+  // generation that never happened also produces no NaN.
+  const hasReceipt = logs.some(l => l.text.includes('Receipt status: real'));
+
+  const failed = hasBodyNaN || hasRootNaN || timedOut || !hasReceipt;
   console.log(`\n[smoke] === Result ===`);
   console.log(`  Body NaN: ${hasBodyNaN}`);
   console.log(`  Root NaN: ${hasRootNaN}`);
-  console.log(`  Status: ${hasBodyNaN || hasRootNaN ? 'FAIL — NaN in output' : 'PASS'}`);
+  console.log(`  Route receipt (status real): ${hasReceipt}`);
+  console.log(`  Timed out: ${timedOut}`);
+  console.log(`  Status: ${failed ? 'FAIL' : 'PASS'}`);
+  if (failed) {
+    if (hasBodyNaN || hasRootNaN) console.log(`    reason: NaN in output`);
+    if (timedOut) console.log(`    reason: no canvas rendered`);
+    if (!hasReceipt) console.log(`    reason: no route receipt — generation may not have run`);
+  }
 
   await browser.close();
-  process.exit(hasBodyNaN || hasRootNaN ? 1 : 0);
+  process.exit(failed ? 1 : 0);
 }
 
 main().catch(err => {

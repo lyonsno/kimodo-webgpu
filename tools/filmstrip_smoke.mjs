@@ -54,16 +54,21 @@ async function main() {
   console.log(`[filmstrip] Generating: "${prompt}"...`);
   await page.click('#generate-btn');
 
-  // Wait for generation to complete (look for "Generated" or "WebGPU" in status)
+  // Wait for the rendered canvas, not for status text. The canvas appearing in
+  // #viewport is the actual completion signal; status text is advisory and was
+  // previously destroyed on success, making this wait unsatisfiable.
   await page.waitForFunction(
     () => {
+      if (document.querySelector('#viewport canvas')) return true;
       const s = document.getElementById('status')?.textContent || '';
-      return s.includes('Generated') || s.includes('WebGPU diffusion') || s.includes('Decode error');
+      return s.includes('Decode error') || s.includes('Error') || s.includes('failed');
     },
     { timeout: 300000 },
   );
 
-  const status = await page.$eval('#status', el => el.textContent);
+  const status = await page
+    .$eval('#status', el => el.textContent)
+    .catch(() => '(status element not present)');
   console.log(`[filmstrip] Status: ${status}`);
 
   if (status.includes('error') || status.includes('Error')) {

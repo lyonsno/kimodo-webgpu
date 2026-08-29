@@ -149,13 +149,21 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     print(f"  Size: {total_mb:.1f} MB ({dtype})")
     print(f"  Header: {header_size} bytes")
 
-    # Write model config sidecar
+    # Write model config sidecar.
+    # These are NOT inferred from the checkpoint — they were established by
+    # per-layer comparison against the PyTorch reference. An earlier version of
+    # this file guessed 16x64 from hidden_dim/64; the real backbone is 8x128,
+    # post-norm, GELU. Guessing here silently corrupts attention head splitting
+    # and yields plausible-looking garbage motion, so do not "simplify" these
+    # back into arithmetic.
     config = {
         "model": "Kimodo-SOMA-RP-v1.1",
         "architecture": "TransformerEncoder",
         "hidden_dim": 1024,
-        "num_heads": 16,  # 1024/64 = 16 heads
-        "head_dim": 64,
+        "num_heads": 8,
+        "head_dim": 128,
+        "norm_first": False,
+        "activation": "gelu",
         "ffn_dim": 2048,
         "num_layers": 16,
         "body_input_dim": 737,
@@ -169,9 +177,24 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
         "dtype": dtype,
     }
     config_path = output_path.with_suffix(".json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"Config written to {config_path}")
+    if config_path.exists():
+        existing = json.loads(config_path.read_text())
+        drift = {k: (existing.get(k), v) for k, v in config.items()
+                 if k != "dtype" and k in existing and existing[k] != v}
+        if drift:
+            print(f"\nRefusing to overwrite {config_path} — it differs from this "
+                  f"script's defaults:")
+            for k, (have, would) in drift.items():
+                print(f"  {k}: on disk {have!r}, would write {would!r}")
+            print("The checked-in config is authoritative (it encodes measured "
+                  "architecture, not inferred values). Delete the file if you "
+                  "genuinely intend to regenerate it.")
+        else:
+            print(f"Config already present and matching: {config_path}")
+    else:
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"Config written to {config_path}")
 
     print(f"\nTensor summary:")
     for entry in tensor_entries:
