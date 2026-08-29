@@ -113,21 +113,46 @@ async function generate() {
     const profile = createStagedProfile();
     profile.start('text-embedding');
 
-    // Step 1: Get text embedding from server
+    // Step 1: Get text embedding from server.
+    // This is the one stage the browser cannot compute. It requires an external
+    // /embed endpoint (see README "Provide a text embedding endpoint"). Fail loud
+    // here rather than proceeding with a zero/garbage embedding, which would still
+    // produce plausible-looking motion and hide the missing prerequisite.
     statusEl.textContent = 'Requesting text embedding from server...';
-    const embResp = await fetch(`${serverUrl}/embed`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-    });
+
+    let embResp;
+    try {
+      embResp = await fetch(`${serverUrl}/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+    } catch (netErr) {
+      statusEl.textContent = `Cannot reach the text embedding server at ${serverUrl}.`;
+      infoEl.textContent =
+        'This route requires an external /embed endpoint returning a 4096-float ' +
+        'text embedding. It is not bundled with this repository — see the README ' +
+        `setup section. (${netErr.message})`;
+      return;
+    }
 
     if (!embResp.ok) {
-      statusEl.textContent = 'Text embedding endpoint not available yet. Need to add /embed to motion-serve.py.';
-      infoEl.textContent = 'The /embed endpoint returns just the 4096-dim text vector. Add it to motion-serve.py.';
+      statusEl.textContent = `Text embedding request failed: ${embResp.status} ${embResp.statusText}.`;
+      infoEl.textContent =
+        `POST ${serverUrl}/embed must accept {"prompt": "..."} and return ` +
+        '{"embedding": [...4096 floats]}. See the README setup section for the contract.';
       return;
     }
 
     const embData = await embResp.json();
+    if (!Array.isArray(embData.embedding) || embData.embedding.length !== modelConfig.text_dim) {
+      statusEl.textContent = 'Text embedding server returned an unusable embedding.';
+      infoEl.textContent =
+        `Expected ${modelConfig.text_dim} floats, got ` +
+        `${Array.isArray(embData.embedding) ? embData.embedding.length : typeof embData.embedding}. ` +
+        'Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B text encoder.';
+      return;
+    }
     const textEmbedding = new Float32Array(embData.embedding);
     profile.end(); // text-embedding
     profile.start('ddim-sampling');

@@ -2,15 +2,15 @@
 
 Run NVIDIA's [Kimodo](https://github.com/nv-tlabs/kimodo) text-to-motion diffusion model **in the browser** using WebGPU compute shaders.
 
-Type a text prompt, get an animated skeleton. The 282M parameter diffusion transformer runs entirely on your GPU through the browser — no Python, no CUDA, no installs.
+Type a text prompt, get an animated skeleton. The 282M parameter diffusion transformer — all 200 forward passes per generation — runs on your GPU through WebGPU compute shaders. No CUDA, no PyTorch in the loop.
 
-https://github.com/user-attachments/assets/placeholder
+**This is a hybrid route, and the split matters.** The browser owns diffusion, classifier-free guidance, DDIM sampling, forward kinematics, and rendering. Text encoding does *not* run in the browser: each generation makes one call to a local Llama 3 8B server for a 4096-float embedding. That server is an external prerequisite you must supply — see [Setup](#setup) before cloning expectations. Without it the app loads, reports the missing endpoint, and cannot generate.
 
 ## What it does
 
 - **Text in → motion out.** "A person walks forward and waves" produces a 6-second, 30fps skeletal animation.
 - **200 GPU compute passes per generation.** 50 DDIM diffusion steps × 2 sub-networks × 2 passes (classifier-free guidance) = 200 transformer forward passes, all running as WebGPU compute shader dispatches.
-- **Client-side diffusion + FK.** The browser handles the full pipeline: DDIM noise scheduling, diffusion denoising, TwostageDenoiser routing, forward kinematics, and skeleton rendering. The server only provides one text embedding vector (4096 floats from Llama 3 8B).
+- **Client-side diffusion + FK.** The browser handles DDIM noise scheduling, diffusion denoising, TwostageDenoiser routing, classifier-free guidance, forward kinematics, and skeleton rendering. The one exception is text encoding: an external server provides a single 4096-float embedding per generation (Llama 3 8B). You must supply that server — it is not included here.
 - **30-joint SOMA skeleton** with full bone connectivity, animated at 30fps.
 
 ## Numerical accuracy
@@ -43,13 +43,13 @@ For comparison, the same model on PyTorch MPS takes ~12s. The WebGPU path is ~2x
 ## Architecture
 
 ```
-Browser                                    Server
-┌─────────────────────────────────┐       ┌──────────────┐
-│  540 MB fp16 weights (cached)   │       │ Llama 3 8B   │
-│  ↓                              │  ←──  │ text encoder  │
-│  DDIM loop (50 steps):          │ 4096  │ (one call)   │
-│    Root model (16-layer xfmr)   │ floats└──────────────┘
-│    globalRootToLocalRoot (JS)   │
+Browser (this repo)                        Server (you supply)
+┌─────────────────────────────────┐       ┌──────────────────┐
+│  540 MB fp16 weights (cached)   │       │ Llama 3 8B       │
+│  ↓                              │  ←──  │ text encoder     │
+│  DDIM loop (50 steps):          │ 4096  │ POST /embed      │
+│    Root model (16-layer xfmr)   │ floats│ (one call/gen)   │
+│    globalRootToLocalRoot (JS)   │       └──────────────────┘
 │    Body model (16-layer xfmr)   │
 │    CFG guidance (JS)            │
 │    DDIM update (JS)             │
@@ -101,15 +101,30 @@ python tools/convert_weights.py \
   --dtype fp16
 ```
 
-### 2. Start the text embedding server
+### 2. Provide a text embedding endpoint
 
-The only server dependency is Llama 3 8B for text encoding. From the [kaminos](https://github.com/lyonsno/kaminos) directory:
+**This is an external prerequisite and it is not shipped in this repository.** Generation will not work until you supply it.
 
-```bash
-python motion-serve.py --model kimodo --port 8098
+The browser needs one thing it cannot compute itself: a 4096-dimension text embedding from Kimodo's LLM2Vec/Llama 3 8B text encoder. The app POSTs to `/embed` on a server you run:
+
+```
+POST <server-url>/embed
+Content-Type: application/json
+
+{ "prompt": "a person walks forward and waves" }
 ```
 
-This loads Kimodo + Llama 3 8B (~16 GB) and exposes `/embed` for text embeddings.
+Expected response:
+
+```json
+{ "embedding": [ ...4096 floats... ], "dim": 4096, "shape": [1, 4096] }
+```
+
+Point the app at your server with the **Server URL** field in the UI (default `http://localhost:8098`).
+
+Any server satisfying that contract works. The reference implementation is `motion-serve.py`, part of the Kaminos research workbench; it is **not currently published**, so treat it as a contract to implement rather than a file to download. To build your own, load `Kimodo-SOMA-RP-v1.1` and return `model.text_encoder([prompt])` flattened to a list — roughly 25 lines around whichever HTTP framework you prefer. Expect ~16 GB of memory for the encoder.
+
+If the endpoint is missing or unreachable, the app fails loud: it reports the unavailable endpoint in the status line and stops rather than silently producing garbage motion.
 
 ### 3. Run
 
