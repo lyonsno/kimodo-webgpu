@@ -13,6 +13,12 @@
 
 const ROUTE_ID = 'kimodo.text-to-motion.webgpu-local.v0';
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
+const MOTION_FEATURE_DIM = 369;
+const KIT_VERSION = '0.1.1';
+// The kit requires a non-empty weights identity. Callers that have not hashed
+// the weight binary pass this sentinel rather than an empty string, so the
+// receipt stays schema-valid while remaining honest about what is unknown.
+const WEIGHTS_HASH_UNKNOWN = 'unknown-weights-hash';
 
 /**
  * Capture WebGPU backend identity from the device.
@@ -122,62 +128,107 @@ export async function createKimodoRouteReceipt({
   backend,
   profile,
   filmstripData,  // optional Uint8Array PNG
+  weightsHash = WEIGHTS_HASH_UNKNOWN,
+  generationId = null,  // binds this receipt to one generation; see main.js
 }) {
   const promptHash = await sha256(prompt);
   const promptId = `prompt-${promptHash.slice(0, 16)}`;
 
-  // Hash outputs
-  const jointsFlat = new Float32Array(joints.flat(2));
+  // Validate the ORIGINAL arrays before hashing or typed-array coercion.
+  //
+  // Counting non-finite values after `new Float32Array(x.flat())` is vacuously
+  // true for empty arrays, blind to truncated or mis-nested data, and lets
+  // coercible values ("0.1", null) become finite numbers before they are ever
+  // checked. Validate structure and element types on the source data instead.
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
+  const validateJoints = () => {
+    if (!Array.isArray(joints) || joints.length === 0) return 'joints is empty or not an array';
+    if (joints.length !== numFrames) return `expected ${numFrames} frames, got ${joints.length}`;
+    for (let f = 0; f < joints.length; f++) {
+      const frame = joints[f];
+      if (!Array.isArray(frame)) return `frame ${f} is not an array`;
+      if (frame.length !== numJoints) return `frame ${f} has ${frame.length} joints, expected ${numJoints}`;
+      for (let j = 0; j < frame.length; j++) {
+        const p = frame[j];
+        if (!Array.isArray(p) || p.length !== 3) return `joint ${f}/${j} is not a 3-tuple`;
+        for (let k = 0; k < 3; k++) if (!isNum(p[k])) return `joint ${f}/${j}[${k}] is not a finite number`;
+      }
+    }
+    return null;
+  };
+
+  const validateMotion = () => {
+    if (!Array.isArray(motionFeatures) || motionFeatures.length === 0) return 'motionFeatures is empty or not an array';
+    if (motionFeatures.length !== numFrames) return `expected ${numFrames} frames, got ${motionFeatures.length}`;
+    for (let f = 0; f < motionFeatures.length; f++) {
+      const row = motionFeatures[f];
+      if (!Array.isArray(row)) return `motion frame ${f} is not an array`;
+      if (row.length !== MOTION_FEATURE_DIM) return `motion frame ${f} has ${row.length} values, expected ${MOTION_FEATURE_DIM}`;
+      for (let i = 0; i < row.length; i++) if (!isNum(row[i])) return `motion ${f}[${i}] is not a finite number`;
+    }
+    return null;
+  };
+
+  const jointsError = validateJoints();
+  const motionError = validateMotion();
+
+  // Hash outputs (safe to coerce now that the source data is validated).
+  const jointsFlat = new Float32Array(jointsError ? [] : joints.flat(2));
   const jointsHash = await sha256(jointsFlat);
   const jointsId = `soma77-joints-${jointsHash.slice(0, 16)}`;
 
-  const motionFlat = new Float32Array(motionFeatures.flat());
+  const motionFlat = new Float32Array(motionError ? [] : motionFeatures.flat());
   const motionHash = await sha256(motionFlat);
   const motionId = `motion-clip-${motionHash.slice(0, 16)}`;
 
-  // Status must depend on the data, not be asserted. Hashing alone cannot
-  // distinguish real output from an array of NaN — both hash fine — so a
-  // hard-coded 'real' would certify garbage as a genuine route result.
-  const countNonFinite = (arr) => {
-    let n = 0;
-    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) n++;
-    return n;
-  };
-  const jointsBad = countNonFinite(jointsFlat);
-  const motionBad = countNonFinite(motionFlat);
-  const jointsStatus = jointsBad === 0 ? 'real' : 'invalid';
-  const motionStatus = motionBad === 0 ? 'real' : 'invalid';
-  const outputsValid = jointsBad === 0 && motionBad === 0;
+  const jointsStatus = jointsError ? 'invalid' : 'real';
+  const motionStatus = motionError ? 'invalid' : 'real';
+  const outputsValid = !jointsError && !motionError;
+
+  // Shapes describe what was OBSERVED, not what the caller declared.
+  const observedJointShape = jointsError
+    ? [Array.isArray(joints) ? joints.length : 0]
+    : [joints.length, joints[0].length, 3];
+  const observedMotionShape = motionError
+    ? [Array.isArray(motionFeatures) ? motionFeatures.length : 0]
+    : [motionFeatures.length, MOTION_FEATURE_DIM];
 
   const outputs = [
     {
       role: 'soma77-joints',
       artifactId: jointsId,
       sha256: jointsHash,
-      shape: [numFrames, numJoints, 3],
+      shape: observedJointShape,
       status: jointsStatus,
-      nonFiniteCount: jointsBad,
+      invalidReason: jointsError,
     },
     {
       role: 'motion-clip',
       artifactId: motionId,
       sha256: motionHash,
-      shape: [numFrames, 369],
+      shape: observedMotionShape,
       status: motionStatus,
-      nonFiniteCount: motionBad,
+      invalidReason: motionError,
     },
   ];
 
   if (filmstripData) {
+    // An empty Uint8Array is truthy; hashing it would certify a nonexistent
+    // image. Require an actual payload before marking the filmstrip real.
     const filmHash = await sha256(filmstripData);
+    const filmValid = filmstripData.byteLength > 0;
     outputs.push({
       role: 'filmstrip',
       artifactId: `filmstrip-${filmHash.slice(0, 16)}`,
       sha256: filmHash,
-      shape: [1],
-      status: 'real',
+      shape: [filmstripData.byteLength],
+      status: filmValid ? 'real' : 'invalid',
+      invalidReason: filmValid ? null : 'empty filmstrip payload',
     });
   }
+
+  const finishedProfile = profile.finish();
 
   return {
     schema: 'kaminos.webgpu-route-receipt.v0',
@@ -186,13 +237,28 @@ export async function createKimodoRouteReceipt({
     status: outputsValid ? 'real' : 'invalid',
     fallbackReason: outputsValid
       ? null
-      : `non-finite output: ${jointsBad} joint value(s), ${motionBad} motion value(s)`,
+      : [jointsError && `joints: ${jointsError}`, motionError && `motion: ${motionError}`]
+          .filter(Boolean).join('; '),
+    // `createdAt` is the kit's freshness-bearing field; `timestamp` is retained
+    // for existing readers.
+    createdAt: new Date().toISOString(),
     timestamp: new Date().toISOString(),
-    backend,
+    generationId,
+    backend: {
+      // The kit requires an explicit backend kind and runtime string.
+      kind: 'webgpu-local',
+      runtime: backend?.runtime || 'browser-webgpu',
+      ...backend,
+    },
     model: {
       id: MODEL_ID,
       revision: 'SOMA-RP-v1.1',
       dtype: 'fp16',
+      weightsHash,
+    },
+    kernel: {
+      kitVersion: KIT_VERSION,
+      profile: 'kimodo-text-to-motion',
     },
     inputs: [{
       role: 'text-prompt',
@@ -200,7 +266,12 @@ export async function createKimodoRouteReceipt({
       sha256: promptHash,
     }],
     outputs,
-    profile: profile.finish(),
+    timings: {
+      source: finishedProfile.timingSource || 'adapter-phase-wall-clock',
+      totalMs: finishedProfile.totalMs ?? 0,
+      stages: Object.values(finishedProfile.stages || {}),
+    },
+    profile: finishedProfile,
     metadata: {
       numFrames,
       numJoints,

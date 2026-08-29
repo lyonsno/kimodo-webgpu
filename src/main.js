@@ -94,11 +94,24 @@ async function init() {
   }
 }
 
+let generationCounter = 0;
+
 async function generate() {
   if (!modelWeights || !gpuDevice) return;
 
   const prompt = document.getElementById('prompt').value.trim();
   if (!prompt) return;
+
+  // Bind this run to a fresh identity and supersede any prior evidence BEFORE
+  // the first await. Otherwise a previous generation's canvas and `real`
+  // receipt are still on the page when a harness installs its wait, letting
+  // run N+1 be certified by run N's result.
+  const generationId = ++generationCounter;
+  window.__kimodoLastReceipt = {
+    status: 'in-progress',
+    generationId,
+    createdAt: new Date().toISOString(),
+  };
 
   const duration = parseFloat(document.getElementById('duration').value) || 6;
   const numSteps = parseInt(document.getElementById('steps').value) || 100;
@@ -315,6 +328,7 @@ async function generate() {
       numSteps,
       backend: setTextEmbeddingEndpoint(gpuBackendIdentity, `${serverUrl}/embed`),
       profile,
+      generationId,
     });
     profile.end(); // output-capture
     // Expose the structured receipt so harnesses can inspect an object rather

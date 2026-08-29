@@ -86,15 +86,26 @@ async function main() {
   // Wait for the rendered canvas, not for status text. #status is moved out of
   // the viewport on success, so polling it for "Generated" times out on a
   // working route — a false negative that made success look like failure.
+  // The click started a new generation; only its own receipt may satisfy this
+  // wait. A prior run's canvas and `real` receipt persist on the page and would
+  // otherwise terminate the wait before this run produced anything.
+  const expectedId = await page.evaluate(
+    () => (window.__kimodoLastReceipt?.generationId ?? null),
+  );
+
   let timedOut = false;
   try {
     await page.waitForFunction(
-      () => {
-        if (document.querySelector('#viewport canvas')) return true;
+      (wantId) => {
+        const r = window.__kimodoLastReceipt;
+        if (r && wantId != null && r.generationId !== wantId) return false;
         const s = document.getElementById('status')?.textContent || '';
-        return s.includes('Error') || s.includes('failed');
+        if (s.includes('Error') || s.includes('failed') || s.includes('unusable')) return true;
+        return !!document.querySelector('#viewport canvas')
+          && !!r && r.status !== 'in-progress';
       },
       { timeout: 120000 },
+      expectedId,
     );
   } catch {
     timedOut = true;
@@ -120,27 +131,31 @@ async function main() {
   // renderSkeleton(), which the live route never calls — so both flags were
   // inert and a NaN-producing run passed cleanly.
   const receipt = await page.evaluate(() => window.__kimodoLastReceipt ?? null);
-  const nonFinite = receipt
-    ? (receipt.outputs || []).reduce((n, o) => n + (o.nonFiniteCount || 0), 0)
-    : null;
 
   const hasReceipt = receipt !== null;
+  const receiptFresh = hasReceipt && (expectedId == null || receipt.generationId === expectedId);
   const receiptReal = hasReceipt && receipt.status === 'real';
   const canvasPresent = await page.$('#viewport canvas') !== null;
+  const invalidOutputs = hasReceipt
+    ? (receipt.outputs || []).filter(o => o.status !== 'real')
+    : [];
 
-  const failed = timedOut || !hasReceipt || !receiptReal || nonFinite > 0 || !canvasPresent;
+  const failed = timedOut || !hasReceipt || !receiptFresh || !receiptReal
+    || invalidOutputs.length > 0 || !canvasPresent;
   console.log(`\n[smoke] === Result ===`);
   console.log(`  Route receipt present: ${hasReceipt}`);
+  console.log(`  Receipt belongs to this generation: ${receiptFresh}`);
   console.log(`  Receipt status: ${hasReceipt ? receipt.status : 'n/a'}`);
-  console.log(`  Non-finite output values: ${nonFinite === null ? 'n/a' : nonFinite}`);
+  console.log(`  Invalid outputs: ${invalidOutputs.length}`);
   console.log(`  Canvas rendered: ${canvasPresent}`);
   console.log(`  Timed out: ${timedOut}`);
   console.log(`  Status: ${failed ? 'FAIL' : 'PASS'}`);
   if (failed) {
     if (timedOut) console.log(`    reason: no terminal state reached`);
     if (!hasReceipt) console.log(`    reason: no route receipt — generation did not run`);
+    else if (!receiptFresh) console.log(`    reason: receipt is from generation ${receipt.generationId}, expected ${expectedId}`);
     else if (!receiptReal) console.log(`    reason: receipt status "${receipt.status}" — ${receipt.fallbackReason}`);
-    if (nonFinite > 0) console.log(`    reason: ${nonFinite} non-finite output value(s)`);
+    for (const o of invalidOutputs) console.log(`    reason: output ${o.role} invalid — ${o.invalidReason}`);
     if (!canvasPresent) console.log(`    reason: no rendered canvas`);
   }
 

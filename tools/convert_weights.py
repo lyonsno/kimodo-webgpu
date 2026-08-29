@@ -13,6 +13,7 @@ Output format matches MoGE's flat binary:
 
 import argparse
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -71,12 +72,38 @@ def build_config(dtype: str) -> dict:
     }
 
 
+def _compatible(have, want) -> bool:
+    """Recursive compatibility check between an on-disk value and a generated one.
+
+    Two rules that a bare `==` gets wrong:
+
+    - `True == 1` in Python, at every nesting depth. A `parents` list containing
+      booleans would compare equal to one containing ints, so booleans are held
+      distinct from numbers explicitly.
+    - `30 == 30.0`, but JSON round-trips can legitimately produce either and the
+      browser consumes both as `Number`. Integral floats are therefore accepted
+      as equal to their integer counterparts.
+    """
+    if isinstance(have, bool) or isinstance(want, bool):
+        return isinstance(have, bool) and isinstance(want, bool) and have == want
+    if isinstance(have, (int, float)) and isinstance(want, (int, float)):
+        return float(have) == float(want)
+    if isinstance(have, list) and isinstance(want, list):
+        return len(have) == len(want) and all(_compatible(h, w) for h, w in zip(have, want))
+    if isinstance(have, dict) and isinstance(want, dict):
+        return have.keys() == want.keys() and all(_compatible(have[k], want[k]) for k in want)
+    return type(have) is type(want) and have == want
+
+
 def check_existing_config(config_path: Path, config: dict):
     """Fail non-zero unless an existing sidecar is compatible with `config`.
 
-    Compares the COMPLETE key set, including keys missing from the existing
-    file and `dtype`. Comparing only shared keys meant an empty `{}` was
-    reported as "matching".
+    Every generated key must be present and compatible, including `dtype`.
+    Comparing only shared keys meant an empty `{}` was reported as "matching".
+
+    Extra keys on disk are deliberately ALLOWED: additive fields from a newer
+    writer should not block a conversion. This is a compatibility policy, not
+    exact key-set equality.
     """
     if not config_path.exists():
         return
@@ -99,7 +126,7 @@ def check_existing_config(config_path: Path, config: dict):
     for key, want in config.items():
         if key not in existing:
             drift[key] = ("<missing>", want)
-        elif existing[key] != want or type(existing[key]) is not type(want):
+        elif not _compatible(existing[key], want):
             drift[key] = (existing[key], want)
 
     if drift:
@@ -204,25 +231,45 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     config_path = output_path.with_suffix(".json")
     check_existing_config(config_path, config)
 
-    with open(output_path, "wb") as f:
-        f.write(MAGIC)
-        f.write(struct.pack("<I", VERSION))
-        f.write(struct.pack("<I", num_tensors))
-        f.write(struct.pack("<I", header_size))
+    # Serialize to a sibling temp file and atomically replace the destination.
+    # Writing directly truncates an existing 540 MB artifact before the
+    # replacement is known complete, so a disk-full error, I/O failure, or
+    # interruption destroys a working binary.
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(MAGIC)
+            f.write(struct.pack("<I", VERSION))
+            f.write(struct.pack("<I", num_tensors))
+            f.write(struct.pack("<I", header_size))
 
-        for entry in tensor_entries:
-            name_bytes = entry["name"].encode("ascii")[:MAX_NAME_LEN]
-            f.write(name_bytes.ljust(MAX_NAME_LEN, b"\x00"))
-            f.write(struct.pack("<I", entry["dtype"]))
-            ndim = len(entry["shape"])
-            f.write(struct.pack("<I", ndim))
-            shape_padded = entry["shape"] + [0] * (MAX_DIMS - ndim)
-            for s in shape_padded:
-                f.write(struct.pack("<I", s))
-            f.write(struct.pack("<I", entry["offset"]))
-            f.write(struct.pack("<I", entry["size"]))
+            for entry in tensor_entries:
+                # Encode before writing so a non-ASCII name fails here, while
+                # the destination is still untouched.
+                name_bytes = entry["name"].encode("ascii")[:MAX_NAME_LEN]
+                f.write(name_bytes.ljust(MAX_NAME_LEN, b"\x00"))
+                f.write(struct.pack("<I", entry["dtype"]))
+                ndim = len(entry["shape"])
+                f.write(struct.pack("<I", ndim))
+                shape_padded = entry["shape"] + [0] * (MAX_DIMS - ndim)
+                for sh in shape_padded:
+                    f.write(struct.pack("<I", sh))
+                f.write(struct.pack("<I", entry["offset"]))
+                f.write(struct.pack("<I", entry["size"]))
 
-        f.write(weight_data)
+            f.write(weight_data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Only now is the payload known complete on disk.
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        # Leave the existing destination untouched on any failure.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
     total_mb = len(weight_data) / (1024 * 1024)
     print(f"Weights written to {output_path}")
@@ -230,10 +277,22 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     print(f"  Size: {total_mb:.1f} MB ({dtype})")
     print(f"  Header: {header_size} bytes")
 
-    # Config was validated before the binary was written; publish it now.
+    # Config was validated before the binary was written; publish it now,
+    # through the same temp-and-replace discipline.
     if not config_path.exists():
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        cfg_tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+        try:
+            with open(cfg_tmp, "w") as f:
+                json.dump(config, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(cfg_tmp, config_path)
+        except BaseException:
+            try:
+                cfg_tmp.unlink()
+            except OSError:
+                pass
+            raise
         print(f"Config written to {config_path}")
     else:
         print(f"Config already present and matching: {config_path}")

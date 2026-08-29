@@ -59,24 +59,37 @@ async function main() {
   // only looked for "error"/"Error", so an /embed failure satisfied the wait,
   // fell through the check, and produced a "successful" filmstrip of an empty
   // pane — a false closure in the evidence harness itself.
-  const terminalState = () => {
+  // Only evidence belonging to THIS generation counts. A prior run leaves both
+  // a canvas and a `real` receipt on the page, which would otherwise satisfy
+  // this wait before the current run produces anything.
+  const terminalState = (expectedId) => {
     const s = document.getElementById('status')?.textContent || '';
-    const failed = /error|failed|unusable|cannot reach|invalid/i.test(s);
-    if (failed) return { done: true, ok: false, status: s };
     const receipt = window.__kimodoLastReceipt;
-    if (document.querySelector('#viewport canvas') && receipt) {
+    if (receipt && expectedId != null && receipt.generationId !== expectedId) {
+      return { done: false };            // stale evidence from an earlier run
+    }
+    if (/error|failed|unusable|cannot reach|invalid/i.test(s)) {
+      return { done: true, ok: false, status: s };
+    }
+    if (document.querySelector('#viewport canvas') && receipt && receipt.status !== 'in-progress') {
       return { done: true, ok: receipt.status === 'real', status: s, receipt: receipt.status };
     }
     return { done: false };
   };
 
+  // The click above started a new generation; its id is the prior id + 1.
+  const expectedId = await page.evaluate(
+    () => (window.__kimodoLastReceipt?.generationId ?? null),
+  );
+
   await page.waitForFunction(
-    // eslint-disable-next-line no-new-func
-    `(${terminalState.toString()})().done`,
+    `(${terminalState.toString()})(${JSON.stringify(expectedId)}).done`,
     { timeout: 300000 },
   );
 
-  const verdict = await page.evaluate(`(${terminalState.toString()})()`);
+  const verdict = await page.evaluate(
+    `(${terminalState.toString()})(${JSON.stringify(expectedId)})`,
+  );
   console.log(`[filmstrip] Status: ${verdict.status}`);
   if (verdict.receipt) console.log(`[filmstrip] Receipt status: ${verdict.receipt}`);
 
