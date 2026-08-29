@@ -14,6 +14,22 @@ main { flex: 1; display: flex; padding: 16px; gap: 16px; }
 #controls { width: 340px; flex-shrink: 0; }
 #viewport { flex: 1; background: #1a1a1a; border-radius: 8px; border: 1px solid #2a2a2a; position: relative; display: flex; align-items: center; justify-content: center; }
 #status { font-size: 13px; color: #555; }
+/* Once the canvas replaces the viewport contents, #status is reparented to
+   body and pinned here so generation progress, success, and failure stay
+   visible to the operator instead of being hidden behind a stale result. */
+#status.status-overlay {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 10;
+  max-width: 60vw;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(20, 20, 20, 0.88);
+  color: #e8e8e8;
+  font-family: monospace;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
+}
 .panel { background: #1f1f1f; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
 label { font-size: 11px; color: #888; display: block; margin-bottom: 4px; }
 textarea, input[type="number"] { width: 100%; padding: 8px; background: #252525; border: 1px solid #333; border-radius: 6px; color: #ccc; font-size: 12px; outline: none; margin-bottom: 8px; resize: vertical; }

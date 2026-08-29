@@ -34,11 +34,32 @@ export function captureBackendIdentity(adapter, device) {
     externalities: [
       {
         service: 'text-embedding',
-        reason: 'Llama 3 8B text encoder runs server-side (MPS). Browser receives a 4096-dim vector via /embed endpoint.',
-        impact: 'Text embedding is not client-side. The diffusion model and FK decode are fully client-side.',
+        // Device is NOT asserted here. The embedding server supports mps,
+        // cuda and cpu, and any compatible server may be pointed at, so
+        // claiming MPS would report a route we did not observe. The effective
+        // endpoint is recorded by the caller via setTextEmbeddingEndpoint().
+        reason: 'Text encoder runs server-side. Browser receives a 4096-dim vector via the /embed endpoint.',
+        impact: 'Text embedding is not client-side. Diffusion, CFG, DDIM and FK decode are client-side.',
+        endpoint: null,
+        device: 'unknown',
       },
     ],
   };
+}
+
+/**
+ * Record the effective text-embedding endpoint on a backend identity object.
+ *
+ * Preserves the route actually used rather than a compile-time assumption.
+ * `device` stays 'unknown' unless the server reports one.
+ */
+export function setTextEmbeddingEndpoint(backend, endpoint, device = 'unknown') {
+  const ext = backend?.externalities?.find(e => e.service === 'text-embedding');
+  if (ext) {
+    ext.endpoint = endpoint ?? null;
+    ext.device = device || 'unknown';
+  }
+  return backend;
 }
 
 /**
@@ -114,20 +135,36 @@ export async function createKimodoRouteReceipt({
   const motionHash = await sha256(motionFlat);
   const motionId = `motion-clip-${motionHash.slice(0, 16)}`;
 
+  // Status must depend on the data, not be asserted. Hashing alone cannot
+  // distinguish real output from an array of NaN — both hash fine — so a
+  // hard-coded 'real' would certify garbage as a genuine route result.
+  const countNonFinite = (arr) => {
+    let n = 0;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) n++;
+    return n;
+  };
+  const jointsBad = countNonFinite(jointsFlat);
+  const motionBad = countNonFinite(motionFlat);
+  const jointsStatus = jointsBad === 0 ? 'real' : 'invalid';
+  const motionStatus = motionBad === 0 ? 'real' : 'invalid';
+  const outputsValid = jointsBad === 0 && motionBad === 0;
+
   const outputs = [
     {
       role: 'soma77-joints',
       artifactId: jointsId,
       sha256: jointsHash,
       shape: [numFrames, numJoints, 3],
-      status: 'real',
+      status: jointsStatus,
+      nonFiniteCount: jointsBad,
     },
     {
       role: 'motion-clip',
       artifactId: motionId,
       sha256: motionHash,
       shape: [numFrames, 369],
-      status: 'real',
+      status: motionStatus,
+      nonFiniteCount: motionBad,
     },
   ];
 
@@ -146,8 +183,10 @@ export async function createKimodoRouteReceipt({
     schema: 'kaminos.webgpu-route-receipt.v0',
     requestedRouteId: ROUTE_ID,
     effectiveRouteId: ROUTE_ID,
-    status: 'real',
-    fallbackReason: null,
+    status: outputsValid ? 'real' : 'invalid',
+    fallbackReason: outputsValid
+      ? null
+      : `non-finite output: ${jointsBad} joint value(s), ${motionBad} motion value(s)`,
     timestamp: new Date().toISOString(),
     backend,
     model: {

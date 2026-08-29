@@ -11,7 +11,7 @@ import { loadWeights } from './lib/weights.js';
 import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
-import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt } from './lib/route-receipt.js';
+import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
 
 const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
@@ -145,15 +145,30 @@ async function generate() {
     }
 
     const embData = await embResp.json();
-    if (!Array.isArray(embData.embedding) || embData.embedding.length !== modelConfig.text_dim) {
+    // Length alone is not enough: Float32Array silently coerces, so 4096
+    // strings become 4096 NaNs and nulls become zeros. Either would reach
+    // diffusion and produce plausible-looking but meaningless motion. Require
+    // every element to be a finite number.
+    const emb = embData.embedding;
+    let embError = null;
+    if (!Array.isArray(emb)) {
+      embError = `expected an array, got ${typeof emb}`;
+    } else if (emb.length !== modelConfig.text_dim) {
+      embError = `expected ${modelConfig.text_dim} floats, got ${emb.length}`;
+    } else {
+      const badIndex = emb.findIndex(v => typeof v !== 'number' || !Number.isFinite(v));
+      if (badIndex !== -1) {
+        embError = `element ${badIndex} is not a finite number (${JSON.stringify(emb[badIndex])})`;
+      }
+    }
+    if (embError) {
       statusEl.textContent = 'Text embedding server returned an unusable embedding.';
       infoEl.textContent =
-        `Expected ${modelConfig.text_dim} floats, got ` +
-        `${Array.isArray(embData.embedding) ? embData.embedding.length : typeof embData.embedding}. ` +
-        'Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B text encoder.';
+        `${embError}. Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B ` +
+        'text encoder and returns finite floats.';
       return;
     }
-    const textEmbedding = new Float32Array(embData.embedding);
+    const textEmbedding = new Float32Array(emb);
     profile.end(); // text-embedding
     profile.start('ddim-sampling');
 
@@ -289,7 +304,8 @@ async function generate() {
     progressBar.style.width = '100%';
     renderSkeletonFromJoints(decoded);
 
-    // Emit route receipt
+    // Emit route receipt. Record the endpoint actually used rather than
+    // assuming a device the server never reported.
     const receipt = await createKimodoRouteReceipt({
       prompt,
       joints: decoded.joints,
@@ -297,14 +313,25 @@ async function generate() {
       numFrames: decoded.num_frames,
       numJoints: decoded.num_joints,
       numSteps,
-      backend: gpuBackendIdentity,
+      backend: setTextEmbeddingEndpoint(gpuBackendIdentity, `${serverUrl}/embed`),
       profile,
     });
     profile.end(); // output-capture
+    // Expose the structured receipt so harnesses can inspect an object rather
+    // than pattern-match a console string.
+    window.__kimodoLastReceipt = receipt;
     console.log('[kimodo-webgpu] Route receipt:', JSON.stringify(receipt.profile));
     console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
 
-    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | fully client-side`;
+    if (receipt.status !== 'real') {
+      statusEl.textContent = `Generation produced invalid output — ${receipt.fallbackReason}`;
+      infoEl.textContent =
+        'The route ran but its output contains non-finite values, so it is not usable motion.';
+      return;
+    }
+
+    // "client-side" is scoped deliberately: text embedding is server-side.
+    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | diffusion+FK client-side, text embedding via server`;
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
@@ -425,13 +452,14 @@ let skelAnimId = null;
 
 function renderSkeletonFromJoints(decoded) {
   const viewport = document.getElementById('viewport');
-  // Move #status out of the viewport rather than removing it. Deleting it here
-  // destroyed the element at the exact moment of success, so any harness
-  // polling #status for "Generated" waited forever on a working route and
-  // reported a timeout — success was indistinguishable from failure.
+  // #status must survive the canvas swap AND stay visible to the operator.
+  // Deleting it broke harnesses (success looked like a timeout); hiding it
+  // broke the operator (second-generation progress and failures became
+  // invisible while a stale canvas still looked current). Move it out of the
+  // replaceable viewport and keep it on screen as an overlay.
   const oldStatus = viewport.querySelector('#status');
-  if (oldStatus) {
-    oldStatus.style.display = 'none';
+  if (oldStatus && oldStatus.parentElement === viewport) {
+    oldStatus.classList.add('status-overlay');
     document.body.appendChild(oldStatus);
   }
 

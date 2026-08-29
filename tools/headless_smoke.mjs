@@ -115,25 +115,33 @@ async function main() {
     }
   }
 
-  // Check for NaN in body output
-  const hasBodyNaN = logs.some(l => l.text.includes('Body output') && l.text.includes('NaN'));
-  const hasRootNaN = logs.some(l => l.text.includes('Root output') && l.text.includes('NaN'));
+  // Inspect the structured receipt, not console strings. The previous NaN
+  // checks scanned for "Body output"/"Root output" messages emitted only by
+  // renderSkeleton(), which the live route never calls — so both flags were
+  // inert and a NaN-producing run passed cleanly.
+  const receipt = await page.evaluate(() => window.__kimodoLastReceipt ?? null);
+  const nonFinite = receipt
+    ? (receipt.outputs || []).reduce((n, o) => n + (o.nonFiniteCount || 0), 0)
+    : null;
 
-  // A receipt proves the route ran; absence of NaN alone does not, since a
-  // generation that never happened also produces no NaN.
-  const hasReceipt = logs.some(l => l.text.includes('Receipt status: real'));
+  const hasReceipt = receipt !== null;
+  const receiptReal = hasReceipt && receipt.status === 'real';
+  const canvasPresent = await page.$('#viewport canvas') !== null;
 
-  const failed = hasBodyNaN || hasRootNaN || timedOut || !hasReceipt;
+  const failed = timedOut || !hasReceipt || !receiptReal || nonFinite > 0 || !canvasPresent;
   console.log(`\n[smoke] === Result ===`);
-  console.log(`  Body NaN: ${hasBodyNaN}`);
-  console.log(`  Root NaN: ${hasRootNaN}`);
-  console.log(`  Route receipt (status real): ${hasReceipt}`);
+  console.log(`  Route receipt present: ${hasReceipt}`);
+  console.log(`  Receipt status: ${hasReceipt ? receipt.status : 'n/a'}`);
+  console.log(`  Non-finite output values: ${nonFinite === null ? 'n/a' : nonFinite}`);
+  console.log(`  Canvas rendered: ${canvasPresent}`);
   console.log(`  Timed out: ${timedOut}`);
   console.log(`  Status: ${failed ? 'FAIL' : 'PASS'}`);
   if (failed) {
-    if (hasBodyNaN || hasRootNaN) console.log(`    reason: NaN in output`);
-    if (timedOut) console.log(`    reason: no canvas rendered`);
-    if (!hasReceipt) console.log(`    reason: no route receipt — generation may not have run`);
+    if (timedOut) console.log(`    reason: no terminal state reached`);
+    if (!hasReceipt) console.log(`    reason: no route receipt — generation did not run`);
+    else if (!receiptReal) console.log(`    reason: receipt status "${receipt.status}" — ${receipt.fallbackReason}`);
+    if (nonFinite > 0) console.log(`    reason: ${nonFinite} non-finite output value(s)`);
+    if (!canvasPresent) console.log(`    reason: no rendered canvas`);
   }
 
   await browser.close();

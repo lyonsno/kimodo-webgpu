@@ -2,7 +2,7 @@
 
 Run NVIDIA's [Kimodo](https://github.com/nv-tlabs/kimodo) text-to-motion diffusion model **in the browser** using WebGPU compute shaders.
 
-Type a text prompt, get an animated skeleton. The 282M parameter diffusion transformer — all 200 forward passes per generation — runs on your GPU through WebGPU compute shaders. No CUDA, no PyTorch in the loop.
+Type a text prompt, get an animated skeleton. The 282M parameter diffusion transformer — all 200 forward passes per generation — runs on your GPU through WebGPU compute shaders. No CUDA, and no PyTorch in the diffusion loop.
 
 **This is a hybrid route, and the split matters.** The browser owns diffusion, classifier-free guidance, DDIM sampling, forward kinematics, and rendering. Text encoding does *not* run in the browser: each generation makes one call to a local Llama 3 8B server for a 4096-float embedding. That server is an external prerequisite you must supply — see [Setup](#setup) before cloning expectations. Without it the app loads, reports the missing endpoint, and cannot generate.
 
@@ -38,7 +38,7 @@ On M4 Max (Chrome, WebGPU via Metal):
 | FK decode (JS, CPU) | ~2ms |
 | **Total** | **~25s for 6 seconds of motion** |
 
-For comparison, the same model on PyTorch MPS takes ~12s. The WebGPU path is ~2x slower due to per-step GPU-CPU synchronization overhead, but runs entirely in the browser.
+For comparison, the same model on PyTorch MPS takes ~12s. The WebGPU path is ~2x slower due to per-step GPU-CPU synchronization overhead, but the diffusion runs in the browser rather than on a server.
 
 ## Architecture
 
@@ -108,8 +108,17 @@ python tools/convert_weights.py \
 The browser cannot compute one thing: the 4096-dimension text embedding from Kimodo's LLM2Vec/Llama 3 8B encoder. `tools/embed_server.py` serves exactly that and nothing else.
 
 ```bash
-# Requires a Kimodo checkout (https://github.com/nv-tlabs/kimodo) and its weights:
-#   huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.1
+# Requires a Kimodo checkout (https://github.com/nv-tlabs/kimodo) and a Python
+# environment with its dependencies — including PyTorch, which Kimodo expects to
+# be installed already and does not declare. The server does NOT read the SOMA
+# diffusion checkpoint; it loads the McGill LLM2Vec encoder repositories, which
+# are downloaded from Hugging Face on first run (~16 GB).
+#
+#   pip install torch "transformers==5.1.0" "peft>=0.18" hydra-core omegaconf einops
+#
+# Note: `pip install -e` on the Kimodo repo builds a C++ extension that does not
+# compile on Apple Silicon (it hardcodes -msse4.1). Setting KIMODO_ROOT is enough
+# for text embedding; the extension is not needed.
 export KIMODO_ROOT=~/dev/kimodo          # default, override if elsewhere
 
 python tools/embed_server.py --port 8098
@@ -121,10 +130,12 @@ Any server satisfying this contract works if you prefer your own:
 
 ```
 POST <server-url>/embed        { "prompt": "a person walks forward and waves" }
-->  200                        { "embedding": [ ...4096 floats... ], "dim": 4096, "shape": [1, 4096] }
+->  200                        { "embedding": [ ...4096 finite floats... ], "dim": 4096 }
 ```
 
-If the endpoint is missing, unreachable, or returns the wrong number of floats, the app fails loud — it reports the problem in the status line and stops, rather than feeding a bad embedding into diffusion and producing plausible-looking nonsense.
+Only the flattened 4096-value `embedding` array is contractual; `dim` is informational.
+
+If the endpoint is missing, unreachable, or returns anything other than 4096 finite numbers, the app fails loud — it reports the problem in the status line and stops, rather than feeding a bad embedding into diffusion and producing plausible-looking nonsense. The server applies the same check before responding.
 
 ### 3. Run
 

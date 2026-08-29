@@ -40,6 +40,80 @@ def load_safetensors(path: str) -> dict:
         return {k: v.numpy() for k, v in load_file(path).items()}
 
 
+def build_config(dtype: str) -> dict:
+    """The sidecar config for a generated binary.
+
+    These are NOT inferred from the checkpoint — they were established by
+    per-layer comparison against the PyTorch reference. An earlier version
+    guessed 16x128 from hidden_dim/64; the real backbone is 8x128, post-norm,
+    GELU. Guessing here silently corrupts attention head splitting and yields
+    plausible-looking garbage motion, so do not "simplify" these into arithmetic.
+    """
+    return {
+        "model": "Kimodo-SOMA-RP-v1.1",
+        "architecture": "TransformerEncoder",
+        "hidden_dim": 1024,
+        "num_heads": 8,
+        "head_dim": 128,
+        "norm_first": False,
+        "activation": "gelu",
+        "ffn_dim": 2048,
+        "num_layers": 16,
+        "body_input_dim": 737,
+        "body_output_dim": 364,
+        "root_input_dim": 738,
+        "root_output_dim": 5,
+        "text_dim": 4096,
+        "max_seq_len": 5000,
+        "parents": [-1, 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 3, 11, 12, 13, 14, 15, 16, 17, 14, 19, 20, 21, 22, 14, 24, 25, 26, 27, 14, 29, 30, 31, 32, 14, 34, 35, 36, 37, 3, 39, 40, 41, 42, 43, 44, 45, 42, 47, 48, 49, 50, 42, 52, 53, 54, 55, 42, 57, 58, 59, 60, 42, 62, 63, 64, 65, 0, 67, 68, 69, 70, 0, 72, 73, 74, 75],
+        "fps": 30,
+        "dtype": dtype,
+    }
+
+
+def check_existing_config(config_path: Path, config: dict):
+    """Fail non-zero unless an existing sidecar is compatible with `config`.
+
+    Compares the COMPLETE key set, including keys missing from the existing
+    file and `dtype`. Comparing only shared keys meant an empty `{}` was
+    reported as "matching".
+    """
+    if not config_path.exists():
+        return
+
+    try:
+        existing = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise SystemExit(
+            f"Existing config {config_path} is unreadable: {e}\n"
+            "Refusing to write a binary that would be paired with a broken "
+            "sidecar. Delete or repair the file to regenerate it."
+        )
+    if not isinstance(existing, dict):
+        raise SystemExit(
+            f"Existing config {config_path} is not a JSON object.\n"
+            "Refusing to write a binary paired with an unusable sidecar."
+        )
+
+    drift = {}
+    for key, want in config.items():
+        if key not in existing:
+            drift[key] = ("<missing>", want)
+        elif existing[key] != want or type(existing[key]) is not type(want):
+            drift[key] = (existing[key], want)
+
+    if drift:
+        lines = "\n".join(
+            f"  {k}: on disk {have!r}, generated {want!r}" for k, (have, want) in sorted(drift.items())
+        )
+        raise SystemExit(
+            f"Existing config {config_path} is incompatible with this conversion:\n"
+            f"{lines}\n"
+            "No binary was written. The checked-in config encodes measured "
+            "architecture; delete it only if you intend to regenerate it."
+        )
+
+
 def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     """Convert state dict to flat binary for WebGPU."""
     tensor_entries = []
@@ -123,6 +197,13 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Validate the sidecar BEFORE touching the binary. Writing 540 MB first and
+    # then refusing to update the config left a new binary paired with a stale
+    # config while the process still exited zero.
+    config = build_config(dtype)
+    config_path = output_path.with_suffix(".json")
+    check_existing_config(config_path, config)
+
     with open(output_path, "wb") as f:
         f.write(MAGIC)
         f.write(struct.pack("<I", VERSION))
@@ -149,52 +230,13 @@ def convert(state_dict: dict, output_path: str, dtype: str = "fp16"):
     print(f"  Size: {total_mb:.1f} MB ({dtype})")
     print(f"  Header: {header_size} bytes")
 
-    # Write model config sidecar.
-    # These are NOT inferred from the checkpoint — they were established by
-    # per-layer comparison against the PyTorch reference. An earlier version of
-    # this file guessed 16x64 from hidden_dim/64; the real backbone is 8x128,
-    # post-norm, GELU. Guessing here silently corrupts attention head splitting
-    # and yields plausible-looking garbage motion, so do not "simplify" these
-    # back into arithmetic.
-    config = {
-        "model": "Kimodo-SOMA-RP-v1.1",
-        "architecture": "TransformerEncoder",
-        "hidden_dim": 1024,
-        "num_heads": 8,
-        "head_dim": 128,
-        "norm_first": False,
-        "activation": "gelu",
-        "ffn_dim": 2048,
-        "num_layers": 16,
-        "body_input_dim": 737,
-        "body_output_dim": 364,
-        "root_input_dim": 738,
-        "root_output_dim": 5,
-        "text_dim": 4096,
-        "max_seq_len": 5000,
-        "parents": [-1, 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 3, 11, 12, 13, 14, 15, 16, 17, 14, 19, 20, 21, 22, 14, 24, 25, 26, 27, 14, 29, 30, 31, 32, 14, 34, 35, 36, 37, 3, 39, 40, 41, 42, 43, 44, 45, 42, 47, 48, 49, 50, 42, 52, 53, 54, 55, 42, 57, 58, 59, 60, 42, 62, 63, 64, 65, 0, 67, 68, 69, 70, 0, 72, 73, 74, 75],
-        "fps": 30,
-        "dtype": dtype,
-    }
-    config_path = output_path.with_suffix(".json")
-    if config_path.exists():
-        existing = json.loads(config_path.read_text())
-        drift = {k: (existing.get(k), v) for k, v in config.items()
-                 if k != "dtype" and k in existing and existing[k] != v}
-        if drift:
-            print(f"\nRefusing to overwrite {config_path} — it differs from this "
-                  f"script's defaults:")
-            for k, (have, would) in drift.items():
-                print(f"  {k}: on disk {have!r}, would write {would!r}")
-            print("The checked-in config is authoritative (it encodes measured "
-                  "architecture, not inferred values). Delete the file if you "
-                  "genuinely intend to regenerate it.")
-        else:
-            print(f"Config already present and matching: {config_path}")
-    else:
+    # Config was validated before the binary was written; publish it now.
+    if not config_path.exists():
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
         print(f"Config written to {config_path}")
+    else:
+        print(f"Config already present and matching: {config_path}")
 
     print(f"\nTensor summary:")
     for entry in tensor_entries:
@@ -221,8 +263,12 @@ def main():
         total = 0
         for name in sorted(state_dict.keys()):
             t = state_dict[name]
-            total += t.numel()
-            print(f"  {name:60s} {str(list(t.shape)):>20s}  {t.numel():>10d}")
+            # numpy arrays expose .size; torch tensors expose .numel(). The
+            # numpy loader is now the default route, so .numel() alone raised
+            # AttributeError here.
+            count = t.numel() if hasattr(t, "numel") else np.asarray(t).size
+            total += count
+            print(f"  {name:60s} {str(list(t.shape)):>20s}  {count:>10d}")
         print(f"\nTotal: {total:,} params ({total*4/1e6:.1f} MB fp32, {total*2/1e6:.1f} MB fp16)")
         return
 

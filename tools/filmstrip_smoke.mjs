@@ -54,25 +54,44 @@ async function main() {
   console.log(`[filmstrip] Generating: "${prompt}"...`);
   await page.click('#generate-btn');
 
-  // Wait for the rendered canvas, not for status text. The canvas appearing in
-  // #viewport is the actual completion signal; status text is advisory and was
-  // previously destroyed on success, making this wait unsatisfiable.
+  // One shared terminal-state classifier for both the wait and the verdict.
+  // Previously the wait accepted lowercase "failed" while the verdict check
+  // only looked for "error"/"Error", so an /embed failure satisfied the wait,
+  // fell through the check, and produced a "successful" filmstrip of an empty
+  // pane — a false closure in the evidence harness itself.
+  const terminalState = () => {
+    const s = document.getElementById('status')?.textContent || '';
+    const failed = /error|failed|unusable|cannot reach|invalid/i.test(s);
+    if (failed) return { done: true, ok: false, status: s };
+    const receipt = window.__kimodoLastReceipt;
+    if (document.querySelector('#viewport canvas') && receipt) {
+      return { done: true, ok: receipt.status === 'real', status: s, receipt: receipt.status };
+    }
+    return { done: false };
+  };
+
   await page.waitForFunction(
-    () => {
-      if (document.querySelector('#viewport canvas')) return true;
-      const s = document.getElementById('status')?.textContent || '';
-      return s.includes('Decode error') || s.includes('Error') || s.includes('failed');
-    },
+    // eslint-disable-next-line no-new-func
+    `(${terminalState.toString()})().done`,
     { timeout: 300000 },
   );
 
-  const status = await page
-    .$eval('#status', el => el.textContent)
-    .catch(() => '(status element not present)');
-  console.log(`[filmstrip] Status: ${status}`);
+  const verdict = await page.evaluate(`(${terminalState.toString()})()`);
+  console.log(`[filmstrip] Status: ${verdict.status}`);
+  if (verdict.receipt) console.log(`[filmstrip] Receipt status: ${verdict.receipt}`);
 
-  if (status.includes('error') || status.includes('Error')) {
-    console.log(`[filmstrip] Generation failed.`);
+  if (!verdict.ok) {
+    console.log(`[filmstrip] FAIL — generation did not produce a valid result.`);
+    console.log(`[filmstrip] No authoritative filmstrip was written.`);
+    await browser.close();
+    process.exit(1);
+  }
+
+  // A canvas is required before any capture; "no canvas" is a failed
+  // generation, never a reason to screenshot the surrounding page.
+  const hasCanvas = await page.$('#viewport canvas');
+  if (!hasCanvas) {
+    console.log(`[filmstrip] FAIL — no rendered canvas; refusing to capture a page fallback.`);
     await browser.close();
     process.exit(1);
   }
@@ -97,26 +116,15 @@ async function main() {
   // Alternative: screenshot the canvas at intervals while it's animating
   console.log(`[filmstrip] Capturing frames every ${every} frames...`);
 
-  // Let it animate and capture screenshots at intervals
+  // Capture the canvas only. There is deliberately no page-screenshot
+  // fallback: a filmstrip of the surrounding UI is not evidence of motion,
+  // and emitting one on failure is exactly how this harness previously lied.
   const screenshots = [];
   const canvas = await page.$('#viewport canvas');
-
-  if (!canvas) {
-    console.log(`[filmstrip] No canvas found — taking full page screenshots`);
-    // Fallback: take viewport screenshots at intervals
-    for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, every * 33)); // ~33ms per frame at 30fps
-      const shot = await page.screenshot({ type: 'png', clip: { x: 340, y: 0, width: 860, height: 800 } });
-      screenshots.push(shot);
-      console.log(`  Frame ${i + 1}/12`);
-    }
-  } else {
-    for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, every * 33));
-      const shot = await canvas.screenshot({ type: 'png' });
-      screenshots.push(shot);
-      console.log(`  Frame ${i + 1}/12`);
-    }
+  for (let i = 0; i < 12; i++) {
+    await new Promise(r => setTimeout(r, every * 33)); // ~33ms per frame at 30fps
+    screenshots.push(await canvas.screenshot({ type: 'png' }));
+    console.log(`  Frame ${i + 1}/12`);
   }
 
   // Save individual frames — composite with ImageMagick montage
