@@ -172,7 +172,7 @@ node tools/filmstrip_smoke.mjs --prompt "a person walks forward"
 
 # Contract tests — no model, no weights, no GPU required
 python tests/test_embed_server_contract.py    # /embed boundary + bind/CORS
-python tests/test_convert_weights_guard.py    # converter pair-atomicity, concurrency, config guards
+python tests/test_convert_weights_guard.py    # converter single-writer atomicity + config guards
 node tests/test_route_receipt_contract.mjs    # receipt validity, authority, hashing, kit contract
 node tests/test_generation_identity.mjs       # generation lifecycle + terminal-state classifier
 ```
@@ -182,6 +182,11 @@ the failure paths rather than the happy path: that the server binds loopback
 only, that malformed requests get stable 400s, that non-finite or wrong-length
 embeddings are refused rather than served, and that an incompatible sidecar
 config can never leave a rewritten binary behind.
+
+Scope note: the converter's publication guarantees are **single-writer**. A
+failed or interrupted conversion cannot damage the existing binary/config pair,
+but two conversions writing the same destination concurrently are not
+serialized against each other — run one at a time per output path.
 
 ## What's next
 

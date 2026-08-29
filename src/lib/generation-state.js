@@ -9,8 +9,15 @@
  * than the shipped code. Divergence is now impossible rather than tested-for.
  *
  * Receipt statuses: 'in-progress' -> exactly one of 'real' | 'invalid' | 'failed'.
- * Every started generation MUST reach a terminal status; ensureTerminalReceipt
- * is the structural backstop that closes any path that forgot.
+ * Every started generation whose awaits SETTLE reaches a terminal status;
+ * ensureTerminalReceipt is the structural backstop that closes any settled
+ * path that forgot.
+ *
+ * Known limitation: the embedding fetch carries no deadline, so an endpoint
+ * that accepts the connection and never completes the response leaves the
+ * generation in-progress indefinitely — the backstop runs in a finally block
+ * that an unsettled await never reaches. Watchers must own their timeout and
+ * treat it as failure.
  */
 
 /** Non-authoritative marker published at generation start, before any await. */

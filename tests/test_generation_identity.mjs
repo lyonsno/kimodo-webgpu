@@ -6,13 +6,15 @@
  * another; and ONE shipped classifier decides terminal state for the app, both
  * harnesses, and these tests.
  *
- * A prior revision tested a local re-implementation of this logic and checked
- * production integration by grepping for tokens — which could not fail when
- * the real wiring was wrong. These tests import the shipped module directly.
- * The single remaining source-level check asserts only that both harnesses call
- * the one exposed choke point (window.__kimodoGenerationState); its behavior is
- * covered by the module tests here and by the live failure-path probe in
- * tools/headless_smoke.mjs.
+ * The module tests below import and execute the shipped module directly.
+ *
+ * The "production wiring" section is weaker and says so: those are source
+ * PRESENCE checks (imports exist, the choke point is assigned, calls appear).
+ * They do not execute generate() and cannot catch a semantically broken call —
+ * an independent review demonstrated a wrong-generation-id mutant passing them.
+ * They guard against wholesale removal only; do not read them as proof of
+ * lifecycle closure. Behavioral coverage of the wiring comes from the live
+ * probes in tools/headless_smoke.mjs, which execute the real page.
  *
  * Run: node tests/test_generation_identity.mjs
  */

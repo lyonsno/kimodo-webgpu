@@ -3,6 +3,12 @@
  * Filmstrip witness — generates motion via WebGPU, captures every Nth frame
  * of the skeleton renderer, composites into a single filmstrip image.
  *
+ * AUTHORITY: the PNG this tool writes is a NON-AUTHORITATIVE visual witness.
+ * The generation's route receipt covers the motion and joint outputs that were
+ * validated and hashed at generation time; it does NOT cover the screenshot
+ * bytes captured afterward. Do not present the image as receipt-backed
+ * evidence — its authority is "a human looked at these frames".
+ *
  * Usage:
  *   node tools/filmstrip_smoke.mjs [--url http://localhost:5176] [--prompt "..."] [--every 10] [--out filmstrip.png]
  */
@@ -94,7 +100,7 @@ async function main() {
 
   if (!verdict.ok) {
     console.log(`[filmstrip] FAIL — generation did not produce a valid result.`);
-    console.log(`[filmstrip] No authoritative filmstrip was written.`);
+    console.log(`[filmstrip] No filmstrip was written.`);
     await browser.close();
     process.exit(1);
   }
@@ -151,6 +157,7 @@ async function main() {
   try {
     execSync(`montage ${framePaths.join(' ')} -tile 4x3 -geometry +2+2 -background '#111111' ${outPath}`);
     console.log(`[filmstrip] Saved filmstrip to ${outPath}`);
+    console.log(`[filmstrip] Note: the image is a non-authoritative visual witness; the route receipt does not cover its bytes.`);
   } catch {
     // Fallback: just save the first frame
     writeFileSync(outPath, screenshots[0]);
