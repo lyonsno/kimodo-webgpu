@@ -17,6 +17,11 @@ VITE_LOG="$SETUP_DIR/vite.log"
 die() { printf '\033[1;31m[run] %s\033[0m\n' "$1" >&2; exit 1; }
 
 [ -x "$PY" ] || die "no venv at $SETUP_DIR/venv — run ./setup.sh first"
+# Port-ownership verification depends on lsof; a missing command must be a
+# named prerequisite failure here, not a false foreign-owner verdict later
+# (command-not-found and "child does not own the port" share an exit class).
+command -v lsof >/dev/null 2>&1 \
+  || die "lsof is required for port-ownership verification and was not found — ensure /usr/sbin is on PATH"
 [ -f public/kimodo.bin ] || die "no weights at public/kimodo.bin — run ./setup.sh first"
 
 if [ -z "${KIMODO_ROOT:-}" ]; then

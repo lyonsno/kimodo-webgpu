@@ -72,10 +72,26 @@ kimodo_ok() {
   [ -d "$KIMODO_DIR/kimodo" ] || return 1
   [ "$(git -C "$KIMODO_DIR" rev-parse HEAD 2>/dev/null)" = "$KIMODO_COMMIT" ]
 }
-# Abandoned temp checkouts from interrupted prior runs carry a different PID
-# in their name and would otherwise accumulate forever.
-rm -rf "$KIMODO_DIR".tmp.* 2>/dev/null || true
+# Reclaim ONLY temp checkouts whose owning PID is provably dead. A different
+# PID in the name is not abandonment — it may be a concurrent setup's live
+# state, and deleting it would sabotage that run.
+for _t in "$KIMODO_DIR".tmp.*; do
+  [ -e "$_t" ] || continue
+  _owner=$(basename "$_t" | sed 's/^kimodo\.tmp\.//; s/\..*$//')
+  case "$_owner" in
+    ''|*[!0-9]*) continue ;;                    # unparseable: leave it alone
+  esac
+  kill -0 "$_owner" 2>/dev/null && continue     # owner alive: not ours to take
+  rm -rf "$_t"
+done
 if ! kimodo_ok; then
+  if [ -L "$KIMODO_DIR" ]; then
+    # A symlinked destination that does not verify is someone's deliberate
+    # arrangement gone stale — never replace or delete through a link.
+    die "kimodo destination check" \
+"$KIMODO_DIR is a symlink but does not verify against the pinned revision.
+Manage the link target manually, or remove the link to let setup rebuild."
+  fi
   if [ -d "$KIMODO_DIR" ] && HAVE=$(git -C "$KIMODO_DIR" rev-parse HEAD 2>/dev/null); then
     if [ "$HAVE" != "$KIMODO_COMMIT" ]; then
       # A real checkout at a DIFFERENT revision: refuse to discard it silently.
@@ -101,13 +117,21 @@ Remove it (rm -rf $KIMODO_DIR) to let setup fetch the pinned revision."
     || { rm -rf "$TMP"; die "kimodo verification" "fetched revision does not match the pin"; }
   [ -d "$TMP/kimodo" ] \
     || { rm -rf "$TMP"; die "kimodo verification" "checkout lacks the kimodo package directory"; }
-  # Guarded publication: name the phase on mv failure, and re-verify the
-  # DESTINATION afterward — directory-form mv can "succeed" by moving the
-  # temp inside a directory that appeared at the destination meanwhile.
+  # Guarded publication: refuse if anything (dir or symlink) appeared at the
+  # destination, name the phase on mv failure, and re-verify the DESTINATION
+  # afterward — directory-form mv can "succeed" by moving the temp inside a
+  # directory that appeared meanwhile. Cleanup on any failure touches ONLY
+  # this invocation's own temp object: collision recovery must never widen
+  # deletion authority through a destination whose identity changed.
+  if [ -e "$KIMODO_DIR" ] || [ -L "$KIMODO_DIR" ]; then
+    rm -rf "$TMP"
+    die "kimodo publication" \
+"something created $KIMODO_DIR while setup was fetching. Inspect it, then re-run."
+  fi
   mv "$TMP" "$KIMODO_DIR" \
     || { rm -rf "$TMP"; die "kimodo publication" "could not move the verified checkout into place"; }
   kimodo_ok \
-    || { rm -rf "$KIMODO_DIR"/*.tmp.* "$TMP" 2>/dev/null || true
+    || { rm -rf "$TMP" 2>/dev/null || true
          die "kimodo publication verification" \
 "the published checkout at $KIMODO_DIR failed verification — something else
 modified that path during setup. Inspect and remove it, then re-run."; }

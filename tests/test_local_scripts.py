@@ -356,6 +356,24 @@ lifecycle_case(
     expect_vite_child_dead=True,
 )
 
+def lsof_missing_case():
+    """lsof unavailable must be a named prerequisite failure — not a false
+    'foreign process bound the port' accusation that kills a healthy child."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sb, logs, env = make_sandbox(tmp)
+        with_lifecycle_venv(sb, "serve")
+        env["PATH"] = f"{sb / 'shims'}:/usr/bin:/bin"   # no /usr/sbin -> no lsof
+        rc, out, timed_out = run(["bash", "run_local.sh"], sb, env, timeout=40,
+                                 extra_env={"EMBED_PORT": str(free_port()),
+                                            "FAKE_EMBED_MODE": "serve",
+                                            "FAKE_VITE_MODE": "idle",
+                                            "FAKE_VITE_PORT": str(free_port())})
+        ok = (not timed_out) and rc != 0 and "lsof" in out and "foreign process" not in out
+        check("missing lsof is a prerequisite failure, not a foreign-owner verdict",
+              ok, f"rc={rc} timed_out={timed_out} :: " + out.strip().replace("\n", " | ")[-250:])
+
+lsof_missing_case()
+
 # ---------------------------------------------------------------------------
 # setup.sh phase-completion scenarios
 # ---------------------------------------------------------------------------
@@ -519,23 +537,82 @@ setup_case(
     expect=lambda sb, logs, out: "FAILED during" in out,
 )
 
-def prep_stale_tmp(sb, logs):
-    """A prior PID's abandoned temp checkout must not accumulate forever."""
+DEAD_PID = None
+LIVE_PROC = None
+
+def _dead_pid():
+    """A PID guaranteed dead: spawn and reap a real child."""
+    global DEAD_PID
+    if DEAD_PID is None:
+        pr = subprocess.run(["/bin/sh", "-c", "echo $$"], capture_output=True, text=True)
+        DEAD_PID = int(pr.stdout.strip())
+    return DEAD_PID
+
+def _live_pid():
+    """A PID guaranteed alive for the test's duration."""
+    global LIVE_PROC
+    if LIVE_PROC is None:
+        LIVE_PROC = subprocess.Popen(["/bin/sleep", "300"])
+    return LIVE_PROC.pid
+
+def _prep_pinned_ok(sb, logs):
     prep_partial_venv(sb, logs)
     d = sb / ".setup" / "kimodo"
     (d / "kimodo").mkdir(parents=True)
     (d / ".git").mkdir()
     (d / ".git" / "FAKE_HEAD").write_text("1aece8c124d73d255ceff5086d983b844c9f4e94\n")
-    stale = sb / ".setup" / "kimodo.tmp.99999"
+
+def prep_stale_tmp(sb, logs):
+    """A temp whose owner PID is provably dead may be reclaimed."""
+    _prep_pinned_ok(sb, logs)
+    stale = sb / ".setup" / f"kimodo.tmp.{_dead_pid()}.deadbeef"
     stale.mkdir()
     (stale / "junk").write_text("abandoned")
 
 setup_case(
-    "abandoned temp checkout from a prior run is cleaned up",
+    "temp checkout with a provably dead owner is reclaimed",
     prep_stale_tmp,
     expect_rc0=True,
-    expect=lambda sb, logs, out: not (sb / ".setup" / "kimodo.tmp.99999").exists(),
+    expect=lambda sb, logs, out: not list((sb / ".setup").glob(f"kimodo.tmp.{DEAD_PID}.*")),
 )
+
+def prep_live_tmp(sb, logs):
+    """A temp whose owner PID is ALIVE belongs to a concurrent run and must
+    never be reclaimed — the prior sweep deleted it on name alone."""
+    _prep_pinned_ok(sb, logs)
+    live = sb / ".setup" / f"kimodo.tmp.{_live_pid()}.cafef00d"
+    live.mkdir()
+    (live / "in-flight").write_text("concurrent run's state")
+
+setup_case(
+    "temp checkout with a LIVE owner survives a concurrent setup",
+    prep_live_tmp,
+    expect_rc0=True,
+    expect=lambda sb, logs, out: (sb / ".setup" / f"kimodo.tmp.{LIVE_PROC.pid}.cafef00d" / "in-flight").exists(),
+)
+
+def prep_symlink_collision(sb, logs):
+    """The destination replaced by a symlink into a directory holding an
+    unrelated temp-shaped entry: publication must refuse BEFORE moving, and
+    nothing in the link target may be deleted."""
+    prep_partial_venv(sb, logs)
+    target = sb / "victim"
+    target.mkdir()
+    (target / "unrelated.tmp.keep").write_text("must survive")
+    (sb / ".setup").mkdir(exist_ok=True)
+    (sb / ".setup" / "kimodo").symlink_to(target)
+
+setup_case(
+    "symlinked destination is refused and never widens deletion authority",
+    prep_symlink_collision,
+    expect_rc0=False,
+    expect=lambda sb, logs, out: "FAILED during" in out
+        and (sb / "victim" / "unrelated.tmp.keep").exists()
+        and not list((sb / ".setup").glob("kimodo.tmp.*")),
+)
+
+if LIVE_PROC is not None:
+    LIVE_PROC.kill()
 
 failed = [n for n, ok, _ in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
