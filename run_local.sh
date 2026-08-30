@@ -37,9 +37,18 @@ SERVER_PID=""
 VITE_PID=""
 INTERRUPTED=0
 
+# Children are launched as process-group leaders (set -m below), so stopping
+# a child stops its whole tree — killing only the npm wrapper PID previously
+# left the real dev-server process running as an orphan.
+stop_tree() {
+  [ -n "$1" ] || return 0
+  kill -TERM -- "-$1" 2>/dev/null || kill -TERM "$1" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$1" 2>/dev/null || true
+}
 stop_children() {
-  [ -n "$VITE_PID" ]   && kill "$VITE_PID"   2>/dev/null || true
-  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+  stop_tree "$VITE_PID"
+  stop_tree "$SERVER_PID"
   [ -n "$VITE_PID" ]   && wait "$VITE_PID"   2>/dev/null || true
   [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null || true
 }
@@ -47,8 +56,10 @@ on_signal() { INTERRUPTED=1; stop_children; echo; echo "[run] stopped."; exit 0;
 trap on_signal INT TERM
 
 echo "[run] starting text-embedding server (log: $SERVER_LOG)..."
+set -m
 PYTHONUNBUFFERED=1 "$PY" tools/embed_server.py --port "$EMBED_PORT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
+set +m
 
 echo -n "[run] waiting for the encoder to load (first run downloads ~16 GB)"
 READY=0
@@ -58,10 +69,20 @@ for _ in $(seq 1 360); do
     tail -15 "$SERVER_LOG" >&2
     die "embed server failed"
   fi
-  # Readiness requires BOTH: our child is alive, and the health document says
-  # the model is actually loaded. A substring match previously accepted
-  # {"model_loaded": false} — and any foreign body at all.
+  # Readiness requires all three, causally tied to OUR child:
+  #   1. the health document says the model is actually loaded;
+  #   2. the child is still alive; and
+  #   3. the child itself OWNS the listening socket. Health + alive alone
+  #      still adopted a foreign server that bound after the pre-check while
+  #      our child was loading — the health answer and the PID were never
+  #      observations of the same process.
   BODY=$(curl -sf -m 2 "http://127.0.0.1:$EMBED_PORT/health" 2>/dev/null || true)
+  if printf '%s' "$BODY" | grep -q '"model_loaded"'; then
+    if ! lsof -a -p "$SERVER_PID" -iTCP:"$EMBED_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      stop_children
+      die "port $EMBED_PORT is answering but not owned by the launched server — a foreign process bound it; stop it or change EMBED_PORT"
+    fi
+  fi
   if printf '%s' "$BODY" | grep -q '"model_loaded": true' && kill -0 "$SERVER_PID" 2>/dev/null; then
     READY=1; echo " ready."; break
   fi
@@ -70,8 +91,10 @@ done
 [ "$READY" = 1 ] || { stop_children; die "embed server did not become healthy within 30 minutes; see $SERVER_LOG"; }
 
 echo "[run] starting app dev server (log: $VITE_LOG)..."
+set -m
 npm run dev >"$VITE_LOG" 2>&1 &
 VITE_PID=$!
+set +m
 URL=""
 for _ in $(seq 1 60); do
   URL=$(grep -oE 'http://localhost:[0-9]+/' "$VITE_LOG" | head -1 || true)

@@ -68,34 +68,45 @@ def foreign_server(port, body):
 
 FAKE_PY = r'''#!/bin/bash
 # Fake .setup/venv/bin/python for lifecycle tests. Behavior via FAKE_EMBED_MODE:
-#   load-forever  : never binds, sleeps (encoder "loading")
-#   serve         : binds the requested --port, answers real health, serves until killed
-#   serve-then-die: as serve, but exits DIE_AFTER seconds after binding
-#   die-loading   : exits 3 after 1s (load failure)
+#   load-forever      : never binds, sleeps (legacy bind-late server, loading)
+#   bind-late         : sleeps BIND_DELAY, THEN tries to bind (models the old
+#                       load-then-bind server; loses bind races -> exit 9)
+#   serve             : binds immediately, model_loaded true, serves until killed
+#   loading-then-ready: binds immediately, model_loaded false for LOAD_SECS, then true
+#   serve-then-die    : as serve, but exits DIE_AFTER seconds after binding
+#   die-loading       : exits 3 after 1s (load failure)
 port=8098
 prev=""
 for a in "$@"; do [ "$prev" = "--port" ] && port="$a"; prev="$a"; done
-case "${FAKE_EMBED_MODE:-serve}" in
-  load-forever) sleep 3600 ;;
+mode="${FAKE_EMBED_MODE:-serve}"
+case "$mode" in
+  load-forever) sleep 3600; exit 0 ;;
   die-loading)  sleep 1; echo "fake load failure" >&2; exit 3 ;;
-  serve|serve-then-die)
-    exec /usr/bin/env python3 - "$port" "${FAKE_EMBED_MODE}" "${DIE_AFTER:-6}" <<'PYEOF'
+esac
+[ "$mode" = "bind-late" ] && sleep "${BIND_DELAY:-2}"
+exec /usr/bin/env python3 - "$port" "$mode" "${DIE_AFTER:-6}" "${LOAD_SECS:-3}" <<'INNERPY'
 import http.server, json, sys, threading, time, os
-port, mode, die_after = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+port, mode, die_after, load_secs = int(sys.argv[1]), sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+state = {"loaded": mode != "loading-then-ready"}
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        b = json.dumps({"status": "ok", "model_loaded": True}).encode()
+        b = json.dumps({"status": "ok" if state["loaded"] else "loading",
+                        "model_loaded": state["loaded"]}).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(b)))
         self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+try:
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+except OSError as e:
+    print(f"bind failed: {e}", file=sys.stderr); sys.exit(9)
+if mode == "loading-then-ready":
+    def finish(): time.sleep(load_secs); state["loaded"] = True
+    threading.Thread(target=finish, daemon=True).start()
 if mode == "serve-then-die":
     def die(): time.sleep(die_after); os._exit(7)
     threading.Thread(target=die, daemon=True).start()
 srv.serve_forever()
-PYEOF
-    ;;
-esac
+INNERPY
 '''
 
 FAKE_NPM = r'''#!/bin/bash
@@ -104,9 +115,17 @@ FAKE_NPM = r'''#!/bin/bash
 if [ "$1" = "install" ]; then echo called >> "$SHIM_LOG_DIR/npm-install.log"; mkdir -p node_modules/.bin; touch node_modules/.bin/vite; exit 0; fi
 if [ "$1" = "run" ] && [ "$2" = "dev" ]; then
   echo "  Local:   http://localhost:${FAKE_VITE_PORT:-5199}/"
-  trap 'echo terminated >> "$SHIM_LOG_DIR/vite-exit.log"; exit 0' TERM INT
-  if [ "${FAKE_VITE_MODE:-idle}" = "die" ]; then sleep "${DIE_AFTER:-3}"; echo "vite crashed" >&2; exit 5; fi
-  while :; do sleep 1; done
+  # Spawn a REAL descendant (the "vite" process) and record its PID, so tests
+  # judge the wrapper's termination against actual process-tree semantics
+  # instead of a collapsed single-PID fake.
+  /usr/bin/env python3 -c "import time
+while True: time.sleep(1)" &
+  CHILD=$!
+  echo "$CHILD" > "$SHIM_LOG_DIR/vite-child.pid"
+  trap 'echo terminated >> "$SHIM_LOG_DIR/vite-exit.log"; kill "$CHILD" 2>/dev/null; exit 0' TERM INT
+  if [ "${FAKE_VITE_MODE:-idle}" = "die" ]; then sleep "${DIE_AFTER:-3}"; kill "$CHILD" 2>/dev/null; echo "vite crashed" >&2; exit 5; fi
+  if [ "${FAKE_VITE_MODE:-idle}" = "orphaning-die" ]; then sleep "${DIE_AFTER:-3}"; echo "wrapper crashed leaving child" >&2; exit 5; fi
+  wait "$CHILD"
 fi
 exit 0
 '''
@@ -217,23 +236,45 @@ def run(cmd, cwd, env, timeout, extra_env=None):
 # ---------------------------------------------------------------------------
 
 def lifecycle_case(name, embed_mode, vite_mode, foreign_body=None, die_after="4",
+                   foreign_delay=None, extra=None,
                    expect_nonzero=True, expect_fast=True, expect_text=None,
-                   expect_sibling_stopped=False):
+                   expect_sibling_stopped=False, expect_vite_child_dead=False):
     with tempfile.TemporaryDirectory() as tmp:
         sb, logs, env = make_sandbox(tmp)
         with_lifecycle_venv(sb, embed_mode)
         port = free_port()
-        srv = foreign_server(port, foreign_body) if foreign_body is not None else None
-        extra = {
+        srv = None
+        timer = None
+        if foreign_body is not None:
+            if foreign_delay is None:
+                srv = foreign_server(port, foreign_body)
+            else:
+                # Bind the foreign listener only AFTER run_local's pre-check
+                # has passed — the race the ownership contract must close.
+                holder_srv = {}
+                def bind_late():
+                    try:
+                        holder_srv["srv"] = foreign_server(port, foreign_body)
+                    except OSError:
+                        pass  # our child won the bind: also a valid outcome
+                timer = threading.Timer(foreign_delay, bind_late)
+                timer.start()
+        e = {
             "EMBED_PORT": str(port),
             "FAKE_EMBED_MODE": embed_mode,
             "FAKE_VITE_MODE": vite_mode,
             "FAKE_VITE_PORT": str(free_port()),
             "DIE_AFTER": die_after,
         }
-        rc, out, timed_out = run(["bash", "run_local.sh"], sb, env, timeout=40, extra_env=extra)
+        if extra:
+            e.update(extra)
+        rc, out, timed_out = run(["bash", "run_local.sh"], sb, env, timeout=40, extra_env=e)
+        if timer:
+            timer.cancel()
         if srv:
             srv.shutdown()
+        if foreign_delay is not None and "srv" in (holder_srv if foreign_body is not None else {}):
+            holder_srv["srv"].shutdown()
         ok = True
         detail = f"rc={rc} timed_out={timed_out}"
         if expect_fast and timed_out:
@@ -248,6 +289,21 @@ def lifecycle_case(name, embed_mode, vite_mode, foreign_body=None, die_after="4"
         if expect_sibling_stopped and not (logs / "vite-exit.log").exists():
             ok = False
             detail += " (vite sibling never stopped)"
+        if expect_vite_child_dead:
+            pidfile = logs / "vite-child.pid"
+            if not pidfile.exists():
+                ok = False
+                detail += " (no vite child was ever spawned)"
+            else:
+                pid = int(pidfile.read_text().strip())
+                time.sleep(1)
+                try:
+                    os.kill(pid, 0)
+                    ok = False
+                    detail += f" (vite descendant {pid} still alive)"
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
         check(name, ok, detail + " :: " + out.strip().replace("\n", " | ")[-300:])
 
 
@@ -275,6 +331,29 @@ lifecycle_case(
 lifecycle_case(
     "vite dying after readiness stops the wrapper non-zero",
     "serve", "die", die_after="3",
+)
+lifecycle_case(
+    "foreign server binding AFTER the pre-check is never adopted (bind race)",
+    "load-forever", "idle",
+    foreign_body=json.dumps({"status": "ok", "model_loaded": True}),
+    foreign_delay=2.0,
+)
+lifecycle_case(
+    "legacy bind-late child losing the port race fails loud, not false-ready",
+    "bind-late", "idle",
+    foreign_body=json.dumps({"status": "ok", "model_loaded": True}),
+    foreign_delay=1.0,
+    extra={"BIND_DELAY": "3"},
+)
+lifecycle_case(
+    "embed death: the real vite DESCENDANT dies with the wrapper",
+    "serve-then-die", "idle", die_after="12",
+    expect_sibling_stopped=True, expect_vite_child_dead=True,
+)
+lifecycle_case(
+    "orphaning vite wrapper crash still leaves no live descendant",
+    "serve", "orphaning-die", die_after="3",
+    expect_vite_child_dead=True,
 )
 
 # ---------------------------------------------------------------------------
@@ -369,6 +448,93 @@ setup_case(
     prep_wrong_pin,
     expect_rc0=False,
     expect=lambda sb, logs, out: "kimodo" in out.lower(),
+)
+
+def prep_vite_sentinel(sb, logs):
+    """node_modules with the vite shim present but everything else missing —
+    a single filesystem sentinel must not substitute for reconciliation."""
+    prep_partial_venv(sb, logs)
+    d = sb / "node_modules" / ".bin"
+    d.mkdir(parents=True)
+    (d / "vite").write_text("#!/bin/sh\n")
+
+setup_case(
+    "vite sentinel alone does not skip npm reconciliation",
+    prep_vite_sentinel,
+    expect_rc0=True,
+    expect=lambda sb, logs, out: (logs / "npm-install.log").exists(),
+)
+
+def prep_sha_ok_pkg_missing(sb, logs):
+    """A valid checkout at the PINNED sha whose package dir is missing —
+    an interrupted state that must be repaired, not misreported as a
+    wrong-revision refusal."""
+    prep_partial_venv(sb, logs)
+    d = sb / ".setup" / "kimodo"
+    (d / ".git").mkdir(parents=True)
+    (d / ".git" / "FAKE_HEAD").write_text("1aece8c124d73d255ceff5086d983b844c9f4e94\n")
+
+setup_case(
+    "pinned-sha checkout missing its package dir is repaired",
+    prep_sha_ok_pkg_missing,
+    expect_rc0=True,
+    expect=lambda sb, logs, out: (sb / ".setup" / "kimodo" / "kimodo").is_dir(),
+)
+
+MV_FAIL_SHIM = "#!/bin/bash\necho mv-fail >> \"$SHIM_LOG_DIR/mv.log\"\nexit 1\n"
+MV_COLLIDE_SHIM = """#!/bin/bash
+# Simulate the destination-collision hazard: directory-form mv succeeding by
+# moving the source INSIDE a newly-appeared destination.
+echo mv-collide >> "$SHIM_LOG_DIR/mv.log"
+src="$1"; dst="$2"
+mkdir -p "$dst"
+/bin/mv "$src" "$dst/"
+exit 0
+"""
+
+def prep_mv_fail(sb, logs):
+    prep_partial_venv(sb, logs)
+    m = sb / "shims" / "mv"
+    m.write_text(MV_FAIL_SHIM)
+    os.chmod(m, 0o755)
+
+setup_case(
+    "kimodo publication (mv) failure names its phase and cleans its temp",
+    prep_mv_fail,
+    expect_rc0=False,
+    expect=lambda sb, logs, out: "FAILED during" in out
+        and not list((sb / ".setup").glob("kimodo.tmp.*")),
+)
+
+def prep_mv_collide(sb, logs):
+    prep_partial_venv(sb, logs)
+    m = sb / "shims" / "mv"
+    m.write_text(MV_COLLIDE_SHIM)
+    os.chmod(m, 0o755)
+
+setup_case(
+    "publication into a colliding destination is caught by post-verification",
+    prep_mv_collide,
+    expect_rc0=False,
+    expect=lambda sb, logs, out: "FAILED during" in out,
+)
+
+def prep_stale_tmp(sb, logs):
+    """A prior PID's abandoned temp checkout must not accumulate forever."""
+    prep_partial_venv(sb, logs)
+    d = sb / ".setup" / "kimodo"
+    (d / "kimodo").mkdir(parents=True)
+    (d / ".git").mkdir()
+    (d / ".git" / "FAKE_HEAD").write_text("1aece8c124d73d255ceff5086d983b844c9f4e94\n")
+    stale = sb / ".setup" / "kimodo.tmp.99999"
+    stale.mkdir()
+    (stale / "junk").write_text("abandoned")
+
+setup_case(
+    "abandoned temp checkout from a prior run is cleaned up",
+    prep_stale_tmp,
+    expect_rc0=True,
+    expect=lambda sb, logs, out: not (sb / ".setup" / "kimodo.tmp.99999").exists(),
 )
 
 failed = [n for n, ok, _ in results if not ok]

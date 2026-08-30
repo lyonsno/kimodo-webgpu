@@ -72,15 +72,22 @@ kimodo_ok() {
   [ -d "$KIMODO_DIR/kimodo" ] || return 1
   [ "$(git -C "$KIMODO_DIR" rev-parse HEAD 2>/dev/null)" = "$KIMODO_COMMIT" ]
 }
+# Abandoned temp checkouts from interrupted prior runs carry a different PID
+# in their name and would otherwise accumulate forever.
+rm -rf "$KIMODO_DIR".tmp.* 2>/dev/null || true
 if ! kimodo_ok; then
   if [ -d "$KIMODO_DIR" ] && HAVE=$(git -C "$KIMODO_DIR" rev-parse HEAD 2>/dev/null); then
-    # A real checkout at the wrong revision: refuse to discard it silently.
-    die "kimodo revision check" \
+    if [ "$HAVE" != "$KIMODO_COMMIT" ]; then
+      # A real checkout at a DIFFERENT revision: refuse to discard it silently.
+      die "kimodo revision check" \
 "existing checkout at $KIMODO_DIR is at $HAVE, expected $KIMODO_COMMIT.
 Remove it (rm -rf $KIMODO_DIR) to let setup fetch the pinned revision."
+    fi
+    # Correct revision but incomplete working tree (interrupted checkout):
+    # safe to rebuild — the content is fully recoverable from the pin.
   fi
-  # Missing, or leftover junk from an interrupted attempt: rebuild in a
-  # temporary directory and publish only a verified checkout.
+  # Missing, junk, or incomplete-at-pin: rebuild in a temporary directory and
+  # publish only a verified checkout.
   rm -rf "$KIMODO_DIR"
   TMP="$KIMODO_DIR.tmp.$$"
   rm -rf "$TMP"
@@ -94,7 +101,16 @@ Remove it (rm -rf $KIMODO_DIR) to let setup fetch the pinned revision."
     || { rm -rf "$TMP"; die "kimodo verification" "fetched revision does not match the pin"; }
   [ -d "$TMP/kimodo" ] \
     || { rm -rf "$TMP"; die "kimodo verification" "checkout lacks the kimodo package directory"; }
-  mv "$TMP" "$KIMODO_DIR"
+  # Guarded publication: name the phase on mv failure, and re-verify the
+  # DESTINATION afterward — directory-form mv can "succeed" by moving the
+  # temp inside a directory that appeared at the destination meanwhile.
+  mv "$TMP" "$KIMODO_DIR" \
+    || { rm -rf "$TMP"; die "kimodo publication" "could not move the verified checkout into place"; }
+  kimodo_ok \
+    || { rm -rf "$KIMODO_DIR"/*.tmp.* "$TMP" 2>/dev/null || true
+         die "kimodo publication verification" \
+"the published checkout at $KIMODO_DIR failed verification — something else
+modified that path during setup. Inspect and remove it, then re-run."; }
 fi
 
 phase "model weights -> public/kimodo.bin (downloads ~540 MB from Hugging Face on first run)"
@@ -109,12 +125,11 @@ PYEOF
 fi
 
 phase "app dependencies (npm install)"
-# The route invokes vite; its presence is the completion predicate, not the
-# existence of a node_modules directory.
-if [ ! -e node_modules/.bin/vite ]; then
-  npm install || die "npm install"
-  [ -e node_modules/.bin/vite ] || die "npm verification" "vite is not installed after npm install"
-fi
+# npm install IS the idempotent reconciliation step — it re-resolves the
+# declared package graph and no-ops when satisfied. A single installed
+# executable is a sentinel, not evidence of a complete dependency tree.
+npm install || die "npm install"
+[ -e node_modules/.bin/vite ] || die "npm verification" "vite is not installed after npm install"
 
 phase "recording setup manifest"
 {
