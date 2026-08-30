@@ -98,10 +98,23 @@ Two commands, on Apple Silicon macOS with Node and Python 3 installed:
 ./run_local.sh    # starts the embedding server and the app, prints the URL; Ctrl-C stops both
 ```
 
-`setup.sh` is idempotent and names its phase on every failure. All installed
-state lives in the gitignored `.setup/` directory; delete it to start over.
-This exact path — network clone, fresh venv, fresh Kimodo checkout — was
-exercised end-to-end (through the live smoke suite) before this section landed.
+`setup.sh` re-runs safely: package installs are re-executed (they no-op when
+satisfied) and completion is verified against what the route actually needs —
+including the pinned Kimodo revision it fetches. Every failure names its
+phase. Generated state lives in four places:
+
+| Surface | Reset with |
+|---|---|
+| `.setup/` (venv, Kimodo checkout, logs, manifest) | `rm -rf .setup` |
+| `public/kimodo.bin` (converted weights) | `rm public/kimodo.bin` |
+| `node_modules/` | `rm -rf node_modules` |
+| Hugging Face cache (checkpoint + encoder, shared with other tools) | leave it, or `hf cache` tooling |
+
+This exact path — network clone, fresh venv, pinned Kimodo fetch — was
+exercised end-to-end (through the live smoke suite) before this section landed,
+and the scripts' failure paths (foreign process on the port, children dying
+after startup, interrupted setup phases) are covered by
+`tests/test_local_scripts.py`, which runs in seconds with no model or network.
 
 ![The app: type a prompt, watch the diffusion progress, get an animated skeleton](assets/kimodo-gui.gif)
 
@@ -198,6 +211,7 @@ node tools/filmstrip_smoke.mjs --prompt "a person walks forward"
 # Contract tests — no model, no weights, no GPU required
 python tests/test_embed_server_contract.py    # /embed boundary + bind/CORS
 python tests/test_convert_weights_guard.py    # converter single-writer atomicity + config guards
+python3 tests/test_local_scripts.py           # setup/run scripts: port ownership, supervision, phase repair
 node tests/test_route_receipt_contract.mjs    # receipt validity, authority, hashing, kit contract
 node tests/test_generation_identity.mjs       # generation lifecycle + terminal-state classifier
 ```
