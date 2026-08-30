@@ -355,6 +355,20 @@ async function generate() {
     // Expose the structured receipt so harnesses can inspect an object rather
     // than pattern-match a console string.
     window.__kimodoLastReceipt = receipt;
+    // Expose the generation's motion data for tooling (retargeting, gait
+    // analysis, export). Same trust level as the receipt: page-local, read by
+    // local harnesses. motion rows are Float32Array(369); the last four values
+    // of each row are the foot-contact channels.
+    window.__kimodoLastMotion = {
+      generationId,
+      prompt,
+      fps: modelConfig.fps,
+      motion,                    // [N] x Float32Array(369) raw features
+      joints: decoded.joints,    // [N][30][3] FK world positions
+      parents: decoded.parents,  // [30] skeleton hierarchy
+      numFrames: decoded.num_frames,
+      numJoints: decoded.num_joints,
+    };
     console.log('[kimodo-webgpu] Route receipt:', JSON.stringify(receipt.profile));
     console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
 
