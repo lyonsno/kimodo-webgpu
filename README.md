@@ -91,6 +91,25 @@ Browser (this repo)                        Server (you supply)
 
 ## Setup
 
+Two commands, on Apple Silicon macOS with Node and Python 3 installed:
+
+```bash
+./setup.sh        # one-shot: venv + deps, Kimodo checkout, weights (~540 MB + ~16 GB encoder on first run)
+./run_local.sh    # starts the embedding server and the app, prints the URL; Ctrl-C stops both
+```
+
+`setup.sh` is idempotent and names its phase on every failure. All installed
+state lives in the gitignored `.setup/` directory; delete it to start over.
+This exact path — network clone, fresh venv, fresh Kimodo checkout — was
+exercised end-to-end (through the live smoke suite) before this section landed.
+
+![The app: type a prompt, watch the diffusion progress, get an animated skeleton](assets/kimodo-gui.gif)
+
+*Captured from a clean clone set up with the two commands above — prompt in, 50 diffusion steps on the browser GPU, skeleton out.*
+
+<details>
+<summary><b>Manual setup</b> (what the scripts do, step by step)</summary>
+
 ### 1. Convert weights
 
 Conversion needs only numpy and safetensors — no torch.
@@ -149,6 +168,8 @@ npm run dev
 ```
 
 Open the URL, type a prompt, click Generate. Weights download on first load (~540 MB), then cached by the browser.
+
+</details>
 
 ## Verification
 
