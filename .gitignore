@@ -2,3 +2,4 @@ node_modules/
 dist/
 public/kimodo.bin
 __pycache__/
+.setup/
