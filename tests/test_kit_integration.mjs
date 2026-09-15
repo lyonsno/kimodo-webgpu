@@ -29,6 +29,7 @@ import {
   WEBGPU_INFERENCE_KIT_VERSION,
   validateWebGpuBackendIdentity,
   classifyWebGpuRouteReceiptEvidence,
+  createKimodoTextToMotionRouteDefinition,
 } from '@kaminos/webgpu-inference-kit';
 import { readFileSync } from 'node:fs';
 
@@ -97,6 +98,30 @@ const goodInput = (backend = kitBackend()) => {
   const evidence = classifyWebGpuRouteReceiptEvidence(receipt);
   check('valid identity nested under an invalid top-level backend cannot classify authoritative',
     evidence.authoritative !== true, JSON.stringify(evidence.classification));
+}
+
+{
+  // Role parity with the installed kit route: the app's emitter must produce
+  // every required output role the kit's Kimodo route declares. (The app
+  // previously emitted the fictional 'soma77-joints' role the 0.1.47 route
+  // repair removed, and the generic consumer classified it authoritative
+  // anyway because it does not check per-route roles.)
+  const receipt = await createKimodoRouteReceipt(goodInput());
+  const definition = createKimodoTextToMotionRouteDefinition();
+  const emitted = new Set(receipt.outputs.map((o) => o.role));
+  const missing = definition.requiredOutputRoles.filter((role) => !emitted.has(role));
+  check('app receipt carries every required role of the installed kit route',
+    missing.length === 0, `missing: ${JSON.stringify(missing)} emitted: ${JSON.stringify([...emitted])}`);
+}
+
+{
+  // Strict-only backend gap: a backend the GENERIC validator accepts but the
+  // strict identity validator rejects must still demote at emission time.
+  const receipt = await createKimodoRouteReceipt(goodInput({ kind: 'webgpu-local', runtime: 'browser' }));
+  check('strict-only backend invalidity demotes at emission time',
+    receipt.status === 'invalid' && receipt.kitValidation?.ok === false
+      && receipt.kitValidation.errors.some((e) => /adapterName|features|limits|timestampQuery/.test(e)),
+    JSON.stringify({ status: receipt.status, v: receipt.kitValidation }));
 }
 
 // --- Emission-time self-validation (review P2b included) -------------------
@@ -185,12 +210,19 @@ function fakeGpuEnvironment({ withTimestamp }) {
   check('initGPU forwards the high-performance adapter preference to the kit path',
     observed.adapterOptions?.powerPreference === 'high-performance',
     JSON.stringify(observed.adapterOptions));
-  check('device request carries the kit\'s six inference limits at adapter values, and only those',
+  const expectedLimits = {
+    maxBufferSize: 1024, maxStorageBufferBindingSize: 512,
+    maxComputeWorkgroupStorageSize: 64, maxComputeInvocationsPerWorkgroup: 256,
+    maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256,
+  };
+  check('device request carries exactly the kit\'s six inference limits at adapter values',
     observed.descriptor
-      && Object.keys(observed.descriptor.requiredLimits).length === 6
-      && observed.descriptor.requiredLimits.maxBufferSize === 1024
-      && !('maxBindGroups' in observed.descriptor.requiredLimits),
+      && JSON.stringify(Object.fromEntries(Object.entries(observed.descriptor.requiredLimits).sort()))
+        === JSON.stringify(Object.fromEntries(Object.entries(expectedLimits).sort())),
     JSON.stringify(observed.descriptor?.requiredLimits));
+  check('adapter options are exactly the declared preference',
+    JSON.stringify(observed.adapterOptions) === JSON.stringify({ powerPreference: 'high-performance' }),
+    JSON.stringify(observed.adapterOptions));
   check('without adapter support, timestamp-query is not requested and is recorded unavailable',
     (observed.descriptor.requiredFeatures ?? []).length === 0
       && backendIdentity.timestampQuery === 'unavailable',
@@ -207,6 +239,18 @@ function fakeGpuEnvironment({ withTimestamp }) {
     (observed.descriptor.requiredFeatures ?? []).includes('timestamp-query')
       && backendIdentity.timestampQuery === 'requested',
     JSON.stringify({ f: observed.descriptor.requiredFeatures, t: backendIdentity.timestampQuery }));
+}
+
+{
+  let message = null;
+  try { await initGPU(null); } catch (err) { message = err.message; }
+  check('missing WebGPU keeps the established unsupported-browser error',
+    /WebGPU is not supported/.test(message ?? ''), String(message));
+
+  message = null;
+  try { await initGPU({ requestAdapter: async () => null }); } catch (err) { message = err.message; }
+  check('null adapter keeps the established no-adapter error',
+    /No WebGPU adapter found/.test(message ?? ''), String(message));
 }
 
 // --- Wiring (source presence, routing only) --------------------------------

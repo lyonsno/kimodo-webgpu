@@ -6,12 +6,12 @@
  *
  * Emits receipts that preserve:
  * - Input: text prompt with artifact id/hash
- * - Outputs: soma77-joints, motion-clip, optional filmstrip
+ * - Outputs: soma-joints, motion-clip, optional filmstrip
  * - Backend: WebGPU adapter/device identity + server-side text embedding note
  * - Profile: staged timing for text-embedding, ddim-sampling, fk-decode, output-capture
  */
 
-import { WEBGPU_INFERENCE_KIT_VERSION, validateRouteReceipt } from '@kaminos/webgpu-inference-kit';
+import { WEBGPU_INFERENCE_KIT_VERSION, validateRouteReceipt, validateWebGpuBackendIdentity } from '@kaminos/webgpu-inference-kit';
 
 const ROUTE_ID = 'kimodo.text-to-motion.webgpu-local.v0';
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
@@ -177,15 +177,26 @@ export function describeInvalidReceipt(receipt) {
  * verdict is recorded either way.
  */
 export function applyKitValidation(receipt) {
+  // The generic receipt validator and the strict backend-identity validator
+  // are DIFFERENT gates: the kit's evidence consumer applies both, so
+  // emission-time self-validation must too — a backend the generic envelope
+  // accepts but the strict identity check rejects would otherwise publish
+  // 'real' locally while classifying invalid downstream.
   const verdict = validateRouteReceipt(receipt);
+  const identityVerdict = validateWebGpuBackendIdentity(receipt.backend);
+  const errors = [
+    ...(verdict.ok ? [] : verdict.errors),
+    ...(identityVerdict.ok ? [] : identityVerdict.errors.map((e) => `backend identity: ${e}`)),
+  ];
+  const ok = verdict.ok && identityVerdict.ok;
   receipt.kitValidation = {
-    ok: verdict.ok,
-    errors: verdict.ok ? [] : [...verdict.errors],
+    ok,
+    errors,
     kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
   };
-  if (!verdict.ok && receipt.status === 'real') {
+  if (!ok && receipt.status === 'real') {
     receipt.status = 'invalid';
-    receipt.fallbackReason = `kit validation failed: ${verdict.errors.join('; ')}`;
+    receipt.fallbackReason = `kit validation failed: ${errors.join('; ')}`;
   }
   return receipt;
 }
@@ -251,7 +262,7 @@ export async function createKimodoRouteReceipt({
   // Hash outputs (safe to coerce now that the source data is validated).
   const jointsFlat = new Float32Array(jointsError ? [] : joints.flat(2));
   const jointsHash = await sha256(jointsFlat);
-  const jointsId = `soma77-joints-${jointsHash.slice(0, 16)}`;
+  const jointsId = `soma-joints-${jointsHash.slice(0, 16)}`;
 
   const motionFlat = new Float32Array(motionError ? [] : motionFeatures.flat());
   const motionHash = await sha256(motionFlat);
@@ -271,7 +282,7 @@ export async function createKimodoRouteReceipt({
 
   const outputs = [
     {
-      role: 'soma77-joints',
+      role: 'soma-joints',
       artifactId: jointsId,
       sha256: jointsHash,
       shape: observedJointShape,
