@@ -95,15 +95,21 @@ const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s
         /from '\.\/lib\/generation-state\.js'/.test(mainSrc));
   check('main.js exposes the classifier choke point',
         /__kimodoGenerationState\s*=/.test(mainSrc));
+  // The in-progress-before-first-await and terminal-backstop invariants now
+  // live in the lifecycle owner (begin() installs the in-progress receipt;
+  // settle() applies ensureTerminalReceipt) and are proven behaviorally in
+  // tests/test_generation_lifecycle.mjs. Here we assert only the routing:
+  // generate() must enter through begin() before any await and settle in its
+  // finally block.
   const genBody = stripComments(mainSrc.slice(mainSrc.indexOf('async function generate()')));
-  const publishIdx = genBody.search(/__kimodoLastReceipt\s*=\s*inProgressReceipt\(/);
+  const beginIdx = genBody.search(/generationLifecycle\.begin\(\)/);
   const firstAwait = genBody.search(/\bawait\s/);
-  check('generate() publishes an in-progress receipt before its first await',
-        publishIdx !== -1 && publishIdx < firstAwait,
-        publishIdx === -1 ? 'inProgressReceipt not used' : `publish at ${publishIdx}, first await at ${firstAwait}`);
-  check('generate() has a terminal backstop (finally + ensureTerminalReceipt)',
-        /finally\s*\{[\s\S]*?ensureTerminalReceipt/.test(genBody),
-        'no finally-guard found');
+  check('generate() enters the lifecycle owner before its first await',
+        beginIdx !== -1 && beginIdx < firstAwait,
+        beginIdx === -1 ? 'lifecycle begin() not used' : `begin at ${beginIdx}, first await at ${firstAwait}`);
+  check('generate() settles the lifecycle owner in its finally block',
+        /finally\s*\{[\s\S]*?run\.settle\(\)/.test(genBody),
+        'no finally settle() found');
 }
 for (const tool of ['headless_smoke.mjs', 'filmstrip_smoke.mjs']) {
   const src = readFileSync(new URL(`../tools/${tool}`, import.meta.url), 'utf8');

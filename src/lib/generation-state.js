@@ -65,6 +65,63 @@ export function ensureTerminalReceipt(receipt, generationId, phase = 'incomplete
  * - An unknown status terminates as failure rather than hanging.
  */
 /**
+ * Generation lifecycle OWNER: single-flight admission plus ownership-checked
+ * evidence publication.
+ *
+ * The review of the motion-export slice demonstrated that a globally callable
+ * generate() with direct global assignments lets an overlapping older
+ * invocation resurrect superseded evidence (or overwrite newer terminal
+ * evidence, depending on completion order). The owner closes both schedules
+ * structurally:
+ *
+ * - Single-flight: begin() returns null while a generation is in flight; a
+ *   second invocation is rejected, not queued.
+ * - Ownership: every publication and the terminal settle are accepted only
+ *   from the handle of the generation that still owns the slot. A retained
+ *   stale handle gets `false` back and mutates nothing.
+ *
+ * The owner writes evidence only through injected sinks, so the same shipped
+ * code is drivable in tests with deferred invocations in both orders.
+ */
+export function createGenerationLifecycle({ setReceipt, setMotion, getReceipt }) {
+  let counter = 0;
+  let activeId = null;
+
+  return {
+    get activeId() { return activeId; },
+    begin() {
+      if (activeId != null) return null;
+      const id = ++counter;
+      activeId = id;
+      setReceipt(inProgressReceipt(id));
+      // Motion evidence is superseded on the same boundary as the receipt.
+      setMotion(null);
+      const owns = () => activeId === id;
+      return {
+        generationId: id,
+        publishFailure(phase, reason) {
+          if (!owns()) return false;
+          setReceipt(failureReceipt(id, phase, reason));
+          return true;
+        },
+        publishSuccess(receipt, motion) {
+          if (!owns()) return false;
+          setReceipt(receipt);
+          setMotion(motion);
+          return true;
+        },
+        settle() {
+          if (!owns()) return false;
+          setReceipt(ensureTerminalReceipt(getReceipt(), id));
+          activeId = null;
+          return true;
+        },
+      };
+    },
+  };
+}
+
+/**
  * Classifier for the motion export (window.__kimodoLastMotion).
  *
  * Motion is generation evidence with NO independent authority: it is usable

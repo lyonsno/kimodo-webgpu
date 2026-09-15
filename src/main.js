@@ -12,7 +12,7 @@ import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from '.
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
 import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
-import { inProgressReceipt, failureReceipt, ensureTerminalReceipt, classifyGenerationState, classifyMotionExport } from './lib/generation-state.js';
+import { classifyGenerationState, classifyMotionExport, createGenerationLifecycle } from './lib/generation-state.js';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
 // decide whether the generation it is watching has terminally settled. Keeping
@@ -122,8 +122,17 @@ async function init() {
   }
 }
 
-let generationCounter = 0;
 let weightsHashPromise = null;
+
+// All generation evidence flows through the lifecycle owner: single-flight
+// admission plus ownership-checked publication. generate() is globally
+// callable (window.generate), so the overlap policy must live at this
+// boundary, not in DOM button state.
+const generationLifecycle = createGenerationLifecycle({
+  setReceipt: (r) => { window.__kimodoLastReceipt = r; },
+  setMotion: (m) => { window.__kimodoLastMotion = m; },
+  getReceipt: () => window.__kimodoLastReceipt ?? null,
+});
 
 async function generate() {
   if (!modelWeights || !gpuDevice) return;
@@ -132,14 +141,16 @@ async function generate() {
   if (!prompt) return;
 
   // Bind this run to a fresh identity and supersede any prior evidence BEFORE
-  // the first await. Otherwise a previous generation's canvas and `real`
-  // receipt are still on the page when a harness installs its wait, letting
-  // run N+1 be certified by run N's result.
-  const generationId = ++generationCounter;
-  window.__kimodoLastReceipt = inProgressReceipt(generationId);
-  // Motion evidence is superseded on the same boundary as the receipt: a
-  // watcher must never read run N's motion while run N+1 is in flight.
-  window.__kimodoLastMotion = null;
+  // the first await — begin() installs the in-progress receipt and clears the
+  // motion export on the same boundary. A second invocation while one is in
+  // flight is rejected, not queued: overlapping runs previously allowed an
+  // older generation to resurrect superseded evidence.
+  const run = generationLifecycle.begin();
+  if (!run) {
+    console.warn(`[kimodo-webgpu] generate() rejected: generation ${generationLifecycle.activeId} is still in flight`);
+    return { rejected: 'generation-in-flight' };
+  }
+  const { generationId } = run;
 
   const duration = parseFloat(document.getElementById('duration').value) || 6;
   const numSteps = parseInt(document.getElementById('steps').value) || 100;
@@ -169,7 +180,7 @@ async function generate() {
         body: JSON.stringify({ prompt }),
       });
     } catch (netErr) {
-      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-unreachable', netErr.message);
+      run.publishFailure('embedding-unreachable', netErr.message);
       statusEl.textContent = `Cannot reach the text embedding server at ${serverUrl}.`;
       infoEl.textContent =
         'This route requires an external /embed endpoint returning a 4096-float ' +
@@ -179,7 +190,7 @@ async function generate() {
     }
 
     if (!embResp.ok) {
-      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-http', `${embResp.status} ${embResp.statusText}`);
+      run.publishFailure('embedding-http', `${embResp.status} ${embResp.statusText}`);
       statusEl.textContent = `Text embedding request failed: ${embResp.status} ${embResp.statusText}.`;
       infoEl.textContent =
         `POST ${serverUrl}/embed must accept {"prompt": "..."} and return ` +
@@ -205,7 +216,7 @@ async function generate() {
       }
     }
     if (embError) {
-      window.__kimodoLastReceipt = failureReceipt(generationId, 'embedding-unusable', embError);
+      run.publishFailure('embedding-unusable', embError);
       statusEl.textContent = 'Text embedding server returned an unusable embedding.';
       infoEl.textContent =
         `${embError}. Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B ` +
@@ -363,23 +374,23 @@ async function generate() {
       weightsHash: weightsHashPromise ? await weightsHashPromise : undefined,
     });
     profile.end(); // output-capture
-    // Expose the structured receipt so harnesses can inspect an object rather
-    // than pattern-match a console string.
-    window.__kimodoLastReceipt = receipt;
-    // Expose the generation's motion data for tooling (retargeting, gait
-    // analysis, export). Same trust level as the receipt: page-local, read by
-    // local harnesses. motion rows are Float32Array(369); the last four values
-    // of each row are the foot-contact channels.
-    window.__kimodoLastMotion = {
+    // Publish the structured receipt plus the generation's motion data for
+    // tooling (retargeting, gait analysis, export) through the lifecycle
+    // owner, which refuses the write if this run no longer owns the slot.
+    // Same trust level as the receipt: page-local, read by local harnesses.
+    // motion rows are plain Array(369) — the representation the receipt
+    // validator certifies — and the last four values of each row are the
+    // foot-contact channels.
+    run.publishSuccess(receipt, {
       generationId,
       prompt,
       fps: modelConfig.fps,
-      motion,                    // [N] x Float32Array(369) raw features
+      motion,                    // [N] x Array(369) raw features
       joints: decoded.joints,    // [N][30][3] FK world positions
       parents: decoded.parents,  // [30] skeleton hierarchy
       numFrames: decoded.num_frames,
       numJoints: decoded.num_joints,
-    };
+    });
     console.log('[kimodo-webgpu] Route receipt:', JSON.stringify(receipt.profile));
     console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
 
@@ -395,15 +406,16 @@ async function generate() {
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
-    window.__kimodoLastReceipt = failureReceipt(generationId, 'exception', err.message);
+    run.publishFailure('exception', err.message);
     statusEl.textContent = `Error: ${err.message}`;
     console.error(err);
   } finally {
-    // Structural backstop: no started generation may settle while still
-    // in-progress, whatever path led here. Individual failure paths above give
-    // better phases; this guard makes forgetting one impossible to ship.
-    window.__kimodoLastReceipt = ensureTerminalReceipt(window.__kimodoLastReceipt, generationId);
-    generateBtn.disabled = false;
+    // Structural backstop: settle() converts a still-in-progress receipt to a
+    // terminal failure and releases the flight slot — and reports whether this
+    // run still owned the generation, which gates re-enabling the controls.
+    if (run.settle()) {
+      generateBtn.disabled = false;
+    }
   }
 }
 window.generate = generate;

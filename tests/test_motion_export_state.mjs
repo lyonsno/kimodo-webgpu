@@ -23,9 +23,11 @@ function check(name, ok, detail = '') {
 }
 
 const realReceipt = (id) => ({ status: 'real', generationId: id });
+// Rows are plain Array(369) — the representation the shipped producer builds
+// and the receipt validator certifies (it requires Array.isArray per row).
 const motion = (id, frames = 3) => ({
   generationId: id,
-  motion: Array.from({ length: frames }, () => new Float32Array(369)),
+  motion: Array.from({ length: frames }, () => new Array(369).fill(0)),
   numFrames: frames,
 });
 
@@ -106,15 +108,20 @@ const motion = (id, frames = 3) => ({
 }
 
 // --- main.js wiring (source presence) ------------------------------------
+// Presence checks here are ROUTING assertions only; the lifecycle behavior
+// itself (clear-at-start, ownership-gated publication, both completion
+// orders) is executed against the shipped owner in
+// tests/test_generation_lifecycle.mjs.
 
 const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
 
-check('main.js clears __kimodoLastMotion at generation start',
-  /__kimodoLastMotion\s*=\s*null/.test(mainSrc),
-  'expected an explicit __kimodoLastMotion = null at generation start');
+check('main.js wires the window evidence globals into the lifecycle owner',
+  mainSrc.includes('createGenerationLifecycle')
+    && /setMotion:\s*\(m\)\s*=>\s*\{\s*window\.__kimodoLastMotion\s*=\s*m/.test(mainSrc));
 
-check('main.js publishes __kimodoLastMotion with the generationId binding',
-  /__kimodoLastMotion\s*=\s*\{\s*\n?\s*generationId/.test(mainSrc));
+check('main.js publishes success evidence only through the owner handle',
+  /run\.publishSuccess\(receipt,\s*\{\s*\n?\s*generationId/.test(mainSrc)
+    && !/window\.__kimodoLastMotion\s*=\s*\{/.test(mainSrc));
 
 check('main.js exposes the motion classifier choke point',
   /__kimodoMotionState\s*=/.test(mainSrc) && mainSrc.includes('classifyMotionExport'));
