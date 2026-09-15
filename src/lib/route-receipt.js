@@ -6,12 +6,12 @@
  *
  * Emits receipts that preserve:
  * - Input: text prompt with artifact id/hash
- * - Outputs: soma77-joints, motion-clip, optional filmstrip
+ * - Outputs: soma-joints, motion-clip, optional filmstrip
  * - Backend: WebGPU adapter/device identity + server-side text embedding note
  * - Profile: staged timing for text-embedding, ddim-sampling, fk-decode, output-capture
  */
 
-import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+import { WEBGPU_INFERENCE_KIT_VERSION, validateRouteReceipt, validateWebGpuBackendIdentity } from '@kaminos/webgpu-inference-kit';
 
 const ROUTE_ID = 'kimodo.text-to-motion.webgpu-local.v0';
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
@@ -23,17 +23,41 @@ const WEIGHTS_HASH_UNKNOWN = 'unknown-weights-hash';
 
 /**
  * Capture WebGPU backend identity from the device.
+ *
+ * The kit-negotiated identity is the TOP-LEVEL authority: the kit's strict
+ * evidence consumer validates receipt.backend itself, so nesting the kit
+ * identity under a legacy shape leaves every receipt classified
+ * non-authoritative (the exact defect the fresh review demonstrated).
+ * Kimodo-specific adapter/device details ride as clearly additive fields
+ * (adapterInfo, deviceInfo, externalities) that the kit validator ignores.
  */
-export function captureBackendIdentity(adapter, device) {
-  return {
+export function captureBackendIdentity(adapter, device, kitIdentity = null) {
+  const base = kitIdentity ? { ...kitIdentity } : {
+    // Legacy path (no kit negotiation): build the minimal kit-shaped
+    // identity honestly. timestampQuery 'unavailable' is the truthful floor
+    // when nobody negotiated the feature.
     kind: 'webgpu-local',
-    adapter: {
+    runtime: 'browser',
+    adapterName: adapter?.info?.description || adapter?.info?.device || adapter?.info?.vendor || 'unknown-webgpu-adapter',
+    browser: globalThis.navigator?.userAgent || null,
+    requestedFeatures: [],
+    features: Array.from(device?.features ?? []),
+    limits: {
+      maxBufferSize: device.limits.maxBufferSize,
+      maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+      maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
+    },
+    timestampQuery: 'unavailable',
+  };
+  return {
+    ...base,
+    adapterInfo: {
       vendor: adapter?.info?.vendor || 'unknown',
       architecture: adapter?.info?.architecture || 'unknown',
       device: adapter?.info?.device || 'unknown',
       description: adapter?.info?.description || 'unknown',
     },
-    device: {
+    deviceInfo: {
       maxBufferSize: device.limits.maxBufferSize,
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
@@ -125,6 +149,59 @@ export function createStagedProfile() {
 }
 
 /**
+ * User-facing explanation for an invalid receipt.
+ *
+ * Invalidity has two distinct causes with different remedies, and the UI
+ * previously explained both with the non-finite-output message — false for a
+ * kit/schema demotion whose outputs are all real. Output-derived invalidity
+ * keeps its established explanation; kit demotion names the kit's reason.
+ */
+export function describeInvalidReceipt(receipt) {
+  const badOutputs = (receipt?.outputs ?? []).filter((o) => o.status !== 'real');
+  if (badOutputs.length > 0) {
+    return 'The route ran but its output contains non-finite values, so it is not usable motion.';
+  }
+  if (receipt?.kitValidation?.ok === false) {
+    return `The route ran but its receipt failed kit validation — ${receipt.fallbackReason}.`;
+  }
+  return `Generation produced an invalid receipt — ${receipt?.fallbackReason ?? 'unknown reason'}.`;
+}
+
+/**
+ * Run the INSTALLED kit's validator against a receipt and record the verdict
+ * on the receipt itself. A receipt the kit rejects demotes to 'invalid' with
+ * the kit's reasons — schema drift between this app and the kit fails loud at
+ * emission time in the live app, not only in the test suite.
+ *
+ * Never upgrades: a receipt that is already non-real keeps its status; the
+ * verdict is recorded either way.
+ */
+export function applyKitValidation(receipt) {
+  // The generic receipt validator and the strict backend-identity validator
+  // are DIFFERENT gates: the kit's evidence consumer applies both, so
+  // emission-time self-validation must too — a backend the generic envelope
+  // accepts but the strict identity check rejects would otherwise publish
+  // 'real' locally while classifying invalid downstream.
+  const verdict = validateRouteReceipt(receipt);
+  const identityVerdict = validateWebGpuBackendIdentity(receipt.backend);
+  const errors = [
+    ...(verdict.ok ? [] : verdict.errors),
+    ...(identityVerdict.ok ? [] : identityVerdict.errors.map((e) => `backend identity: ${e}`)),
+  ];
+  const ok = verdict.ok && identityVerdict.ok;
+  receipt.kitValidation = {
+    ok,
+    errors,
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+  };
+  if (!ok && receipt.status === 'real') {
+    receipt.status = 'invalid';
+    receipt.fallbackReason = `kit validation failed: ${errors.join('; ')}`;
+  }
+  return receipt;
+}
+
+/**
  * Create a Kimodo text-to-motion route receipt.
  */
 export async function createKimodoRouteReceipt({
@@ -186,7 +263,7 @@ export async function createKimodoRouteReceipt({
   // Hash outputs (safe to coerce now that the source data is validated).
   const jointsFlat = new Float32Array(jointsError ? [] : joints.flat(2));
   const jointsHash = await sha256(jointsFlat);
-  const jointsId = `soma77-joints-${jointsHash.slice(0, 16)}`;
+  const jointsId = `soma-joints-${jointsHash.slice(0, 16)}`;
 
   const motionFlat = new Float32Array(motionError ? [] : motionFeatures.flat());
   const motionHash = await sha256(motionFlat);
@@ -206,7 +283,7 @@ export async function createKimodoRouteReceipt({
 
   const outputs = [
     {
-      role: 'soma77-joints',
+      role: 'soma-joints',
       artifactId: jointsId,
       sha256: jointsHash,
       shape: observedJointShape,
@@ -249,7 +326,7 @@ export async function createKimodoRouteReceipt({
     .map((o) => `${o.role}: ${o.invalidReason ?? 'invalid'}`);
   const allOutputsValid = invalidReasons.length === 0;
 
-  return {
+  return applyKitValidation({
     schema: 'kaminos.webgpu-route-receipt.v0',
     requestedRouteId: ROUTE_ID,
     effectiveRouteId: ROUTE_ID,
@@ -261,9 +338,12 @@ export async function createKimodoRouteReceipt({
     timestamp: new Date().toISOString(),
     generationId,
     backend: {
-      // The kit requires an explicit backend kind and runtime string.
+      // The kit's strict evidence consumer validates this object as a kit
+      // backend identity; callers pass the kit-negotiated identity (with
+      // additive Kimodo detail fields), and these fallbacks only backstop
+      // legacy callers.
       kind: 'webgpu-local',
-      runtime: backend?.runtime || 'browser-webgpu',
+      runtime: backend?.runtime || 'browser',
       ...backend,
     },
     model: {
@@ -300,5 +380,5 @@ export async function createKimodoRouteReceipt({
       fkBackend: 'js-cpu',
       gpuSubmission,
     },
-  };
+  });
 }

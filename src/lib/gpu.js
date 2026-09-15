@@ -1,30 +1,40 @@
 /**
  * WebGPU initialization and device management.
+ *
+ * Device acquisition goes through @kaminos/webgpu-inference-kit: the kit
+ * carries its six supported inference limits (maxBufferSize,
+ * maxStorageBufferBindingSize, maxComputeWorkgroupStorageSize,
+ * maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX/Y) at
+ * adapter-reported values — no smaller application caps, but also not the
+ * full WebGPU limit set — and negotiates timestamp-query ('prefer':
+ * requested when the adapter has it, cleanly absent when it doesn't), the
+ * timing authority the adaptive command-duty planner can consume.
+ *
+ * `gpu` is injectable so the delegation is testable behaviorally (the
+ * fake records the actual adapter options and device descriptor).
  */
 
-export async function initGPU() {
-  if (!navigator.gpu) {
+import { requestBrowserWebGpuDevice } from '@kaminos/webgpu-inference-kit';
+
+export async function initGPU(gpu = navigator.gpu) {
+  if (!gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
   }
 
-  const adapter = await navigator.gpu.requestAdapter({
-    powerPreference: 'high-performance',
-  });
-  if (!adapter) {
-    throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
+  let acquired;
+  try {
+    acquired = await requestBrowserWebGpuDevice(gpu, {
+      adapterOptions: { powerPreference: 'high-performance' },
+      timestampQuery: 'prefer',
+      label: 'kimodo-webgpu',
+    });
+  } catch (err) {
+    if (/adapter unavailable/i.test(err?.message ?? '')) {
+      throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
+    }
+    throw err;
   }
-
-  // Request max limits for large model inference
-  const device = await adapter.requestDevice({
-    requiredLimits: {
-      maxBufferSize: adapter.limits.maxBufferSize,
-      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
-      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
-      maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
-    },
-  });
+  const { adapter, device, backendIdentity } = acquired;
 
   device.lost.then((info) => {
     console.error('WebGPU device lost:', info.message);
@@ -33,7 +43,7 @@ export async function initGPU() {
     }
   });
 
-  return { adapter, device };
+  return { adapter, device, backendIdentity };
 }
 
 /**

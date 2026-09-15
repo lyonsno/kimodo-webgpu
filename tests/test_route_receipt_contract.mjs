@@ -22,11 +22,18 @@ const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok, detail });
 
 const profile = () => { const p = createStagedProfile(); p.start('s'); p.end(); return p; };
+// A kit-valid backend identity: emission-time self-validation now composes
+// the strict identity validator, so the fixture must be what a real caller
+// provides (the legacy pre-identity shape correctly demotes to invalid).
 const backend = () => ({
   kind: 'webgpu-local',
-  runtime: 'test-runtime',
-  adapter: { vendor: 'test', architecture: 'test' },
-  device: {},
+  runtime: 'browser',
+  adapterName: 'test-adapter',
+  browser: 'test-harness',
+  requestedFeatures: [],
+  features: ['shader-f16'],
+  limits: { maxBufferSize: 1024 },
+  timestampQuery: 'unavailable',
   externalities: [{ service: 'text-embedding', endpoint: null, device: 'unknown' }],
 });
 
@@ -83,7 +90,7 @@ for (const [label, over] of bad) {
   let ok = false;
   try {
     const r = await receipt({ joints: goodJoints(1, 4) }); // claims 2 frames, supplies 1
-    const jointsOut = r.outputs.find(o => o.role === 'soma77-joints');
+    const jointsOut = r.outputs.find(o => o.role === 'soma-joints');
     ok = r.status !== 'real' || jointsOut.shape[0] === 1;
   } catch { ok = true; }
   check('shape reflects observed data or run is refused', ok);

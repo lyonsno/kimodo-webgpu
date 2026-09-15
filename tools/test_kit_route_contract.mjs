@@ -14,14 +14,14 @@ import {
 
 const [kitMajor, kitMinor, kitPatch] = WEBGPU_INFERENCE_KIT_VERSION.split('.').map(Number);
 assert.deepEqual([kitMajor, kitMinor], [0, 1]);
-assert.ok(kitPatch >= 4, `breathability contract requires kit >=0.1.4, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
+assert.ok(kitPatch >= 47, `repaired route contract requires kit >=0.1.47, got ${WEBGPU_INFERENCE_KIT_VERSION}`);
 
 const requiredStages = ['text-embedding', 'ddim-sampling', 'fk-decode', 'output-capture'];
 
 const definition = createKimodoTextToMotionRouteDefinition({
   kernel: {
     kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
-    profile: 'twostage-denoiser-ddim50-fk',
+    profile: 'kimodo-text-to-motion',
     commit: 'kimodo-webgpu-kit-contract-smoke',
   },
 });
@@ -42,6 +42,7 @@ assert.deepEqual(
     ['output-capture', 'readback-bound', false],
   ],
 );
+assert.equal(definition.worker.motionFormat, 'kimodo-soma30-explicit-joints');
 assert.ok(
   definition.scheduler.breathability.checkpoints.some(
     checkpoint => checkpoint.kind === 'diffusion-step' && checkpoint.afterStage === 'ddim-sampling' && checkpoint.yieldable,
@@ -50,7 +51,7 @@ assert.ok(
 );
 assert.deepEqual(
   definition.outputRoles.filter(output => output.required).map(output => output.role),
-  ['soma77-joints', 'motion-clip'],
+  ['soma-joints', 'motion-clip'],
 );
 
 const backend = createWebGpuBackendIdentity({
@@ -82,15 +83,15 @@ const receipt = createKimodoTextToMotionRouteReceipt({
     shape: [1],
   },
   outputs: {
-    soma77Joints: {
-      artifactId: 'soma77-joints:test',
+    somaJoints: {
+      artifactId: 'soma-joints:test',
       sha256: 'sha256-joints',
-      shape: [90, 77, 3],
+      shape: [180, 30, 3],
     },
     motionClip: {
       artifactId: 'motion-clip:test',
       sha256: 'sha256-motion',
-      shape: [1],
+      shape: [180, 369],
     },
     filmstrip: {
       artifactId: 'filmstrip:test',
@@ -105,7 +106,7 @@ const receipt = createKimodoTextToMotionRouteReceipt({
   },
   kernel: {
     kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
-    profile: 'twostage-denoiser-ddim50-fk',
+    profile: 'kimodo-text-to-motion',
     commit: 'kimodo-webgpu-kit-contract-smoke',
   },
   profile,
@@ -115,7 +116,7 @@ const result = validateRouteReceipt(receipt);
 assert.equal(result.ok, true, result.errors.join('; '));
 assert.equal(receipt.requestedRouteId, KIMODO_TEXT_TO_MOTION_ROUTE_ID);
 assert.deepEqual(receipt.outputs.map(output => output.role), [
-  'soma77-joints',
+  'soma-joints',
   'motion-clip',
   'filmstrip',
 ]);
