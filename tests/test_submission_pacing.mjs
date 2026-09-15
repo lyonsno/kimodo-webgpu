@@ -199,4 +199,118 @@ const fakeWeights = () => {
     counters.mapReadBuffers === 4, `mapReadBuffers=${counters.mapReadBuffers}`);
 }
 
+// --- Allocation accounting: fixed scratch, not per-layer growth ------------
+// The r1 single-encoder cut kept all 16 layers' scratch simultaneously live
+// (~249 MiB at 180 frames, ~738 MiB at the UI-maximum 540) while claiming
+// "same peak". Scratch is now a fixed reused set: peak live logical bytes
+// must be bounded by ONE layer's working set, at the default AND the
+// maximum supported duration, and every per-call buffer must be destroyed
+// after a successful pass (the returned output excepted until its caller
+// frees it).
+
+function makeAccountingDevice(counters, { failSubmit = false } = {}) {
+  const live = new Map(); // buffer object -> bytes
+  let liveBytes = 0;
+  const acct = {
+    peakBytes: 0,
+    createdCount: 0,
+    destroyedCount: 0,
+    get liveBytes() { return liveBytes; },
+    live,
+  };
+  const passEncoder = { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} };
+  const device = {
+    createShaderModule: () => ({}),
+    createComputePipeline: () => ({ getBindGroupLayout: () => ({}) }),
+    createBindGroup: () => ({}),
+    createBuffer: (desc) => {
+      acct.createdCount++;
+      const buf = {
+        size: desc.size,
+        destroy() {
+          if (live.has(buf)) { liveBytes -= desc.size; live.delete(buf); acct.destroyedCount++; }
+        },
+        mapAsync: async () => {},
+        getMappedRange: () => new ArrayBuffer(desc.size),
+        unmap() {},
+      };
+      live.set(buf, desc.size);
+      liveBytes += desc.size;
+      acct.peakBytes = Math.max(acct.peakBytes, liveBytes);
+      return buf;
+    },
+    createCommandEncoder: () => ({
+      copyBufferToBuffer() {},
+      beginComputePass: () => passEncoder,
+      finish: () => ({}),
+    }),
+    queue: {
+      submit: () => { if (failSubmit) throw new Error('injected queue submit failure'); },
+      onSubmittedWorkDone: async () => {},
+      writeBuffer() {},
+    },
+    limits: {},
+  };
+  return { device, acct };
+}
+
+const MiB = 1024 * 1024;
+
+async function measureForward(frames, { failSubmit = false } = {}) {
+  const { device, acct } = makeAccountingDevice({}, { failSubmit });
+  let out = null, error = null;
+  try {
+    out = await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, frames, 738, 5);
+  } catch (err) { error = err; }
+  return { acct, out, error };
+}
+
+{
+  const def = await measureForward(180);
+  const max = await measureForward(540);
+  check('default-duration pass peaks under 64 MiB of logical scratch',
+    def.acct.peakBytes < 64 * MiB, `${(def.acct.peakBytes / MiB).toFixed(1)} MiB`);
+  check('maximum-duration (540-frame) pass peaks under 120 MiB of logical scratch',
+    max.acct.peakBytes < 120 * MiB, `${(max.acct.peakBytes / MiB).toFixed(1)} MiB`);
+  // The old regression scaled peak with layer count; the fixed set does not:
+  // sixteen layers' worth at 540 frames was ~738 MiB.
+  // Persistent per-device caches (uniforms, dummy mask) legitimately stay
+  // live; the honest leak check is the warm-cache delta: a second identical
+  // pass on the same device must add exactly ONE live buffer — its output.
+  const { device: warmDev, acct: warmAcct } = makeAccountingDevice({});
+  await forwardTransformer(warmDev, fakeWeights(), anyBuffer(), anyBuffer(), 500, 180, 738, 5);
+  const liveAfterFirst = warmAcct.live.size;
+  await forwardTransformer(warmDev, fakeWeights(), anyBuffer(), anyBuffer(), 500, 180, 738, 5);
+  check('a warm-cache pass leaks nothing: live delta is exactly the returned output',
+    warmAcct.live.size === liveAfterFirst + 1,
+    `first=${liveAfterFirst} second=${warmAcct.live.size}`);
+}
+
+{
+  const { acct, out, error } = await measureForward(180, { failSubmit: true });
+  check('an injected queue-submit failure propagates from the pass',
+    out === null && /injected queue submit failure/.test(error?.message ?? ''), String(error?.message));
+  check('a rejected submission destroys every per-call buffer including the would-be output',
+    acct.live.size <= 2,
+    `live=${acct.live.size} (persistent cached uniforms/dummy mask only)`);
+}
+
+{
+  // Same rejection path through the INSTALLED controller (duplicate duty).
+  const counters = makeCounters();
+  const { device, acct } = makeAccountingDevice({});
+  const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 2 });
+  await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 4, 738, 5, null,
+    { submissions, dutyId: 'dup' });
+  const before = acct.live.size;
+  let threw = null;
+  try {
+    await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 4, 738, 5, null,
+      { submissions, dutyId: 'dup' });
+  } catch (err) { threw = err; }
+  check('a controller-rejected duty leaks no per-call buffers',
+    threw != null && acct.live.size === before,
+    `before=${before} after=${acct.live.size}`);
+}
+
 process.exit(failures ? 1 : 0);
