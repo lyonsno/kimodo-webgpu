@@ -1,25 +1,24 @@
 /**
- * Submission-pacing contract (slice C).
+ * Submission-pacing contract (slice C, revision after the combined review).
  *
- * The DDIM route previously fenced the host on onSubmittedWorkDone after
- * nearly every encoder (~70 per forward pass, 4 passes per step, plus a
- * debug GPU readback with console dumps on every pass): tens of thousands
- * of host<->GPU round-trips per generation. The contract now:
+ * The review demonstrated two false claims in the first cut: duty IDs
+ * collided between CFG passes (every real generation would fail its first
+ * step against the installed controller), and per-encoder duties relocated
+ * ~28k prefix fences INTO the kit while the permissive fake counted zero.
  *
- * 1. forwardTransformer emits NO host fences of its own. Correctness needs
- *    only queue submission order; the only lawful fence is inside
- *    readBuffer, at a real readback boundary.
- * 2. With a submissions context (the kit's bounded submission queue shape),
- *    every command buffer routes through submitDuty — the queue controller
- *    owns queue.submit, so admission depth actually paces the GPU.
- *    Without one, command buffers submit directly (still unfenced).
- * 3. The per-pass debug readback is gone: forwardTransformer allocates no
- *    MAP_READ buffer.
- * 4. denoiseStepWebGPU threads the submissions context through both models
- *    and both CFG passes, and still performs exactly its four required
- *    readbacks (root + body, conditioned + unconditioned).
+ * The contract now, proven against the INSTALLED kit controller:
  *
- * Driven through the SHIPPED modules with a counting fake device.
+ * 1. One forward pass = ONE command encoder = ONE duty. forwardTransformer
+ *    emits no host fences itself and performs no debug readback.
+ * 2. Duty identity is caller-owned and unique for the generation:
+ *    {prefix}-{cond|uncond}-{root|body}. A duplicate duty id must throw in
+ *    the installed controller (negative case pinned).
+ * 3. Effective fence accounting at pass granularity: one denoise step =
+ *    4 duties (one kit prefix fence each) + 4 readback fences = 8 queue
+ *    fences per step (~800 per 100-step generation), down from ~29,000 at
+ *    encoder granularity. The test asserts the EXACT counts for one step
+ *    against the real controller and a counting fake queue.
+ * 4. drain() terminates with submitted == completed == 4 and zero failures.
  */
 
 globalThis.GPUBufferUsage = {
@@ -30,6 +29,7 @@ globalThis.GPUMapMode = { READ: 0x0001, WRITE: 0x0002 };
 
 const { forwardTransformer, readBuffer } = await import('../src/lib/inference.js');
 const { denoiseStepWebGPU } = await import('../src/lib/denoiser.js');
+const { createWebGpuBoundedSubmissionQueue } = await import('@kaminos/webgpu-inference-kit');
 
 let failures = 0;
 function check(name, ok, detail = '') {
@@ -38,7 +38,7 @@ function check(name, ok, detail = '') {
 }
 
 function makeCounters() {
-  return { directSubmits: 0, fences: 0, mapReadBuffers: 0, finished: 0 };
+  return { directSubmits: 0, queueSubmits: 0, fences: 0, mapReadBuffers: 0, finished: 0 };
 }
 
 function makeFakeDevice(counters) {
@@ -65,7 +65,7 @@ function makeFakeDevice(counters) {
       finish: () => ({ __cb: ++counters.finished }),
     }),
     queue: {
-      submit: () => { counters.directSubmits++; },
+      submit: () => { counters.queueSubmits++; },
       onSubmittedWorkDone: async () => { counters.fences++; },
       writeBuffer() {},
     },
@@ -93,49 +93,58 @@ const fakeWeights = () => {
   };
 };
 
-function makeSubmissions() {
-  const record = { duties: [], drained: false };
-  return {
-    record,
-    submitDuty: async ({ dutyId, commandBuffers }) => {
-      record.duties.push({ dutyId, count: commandBuffers.length });
-    },
-    drain: async () => { record.drained = true; return { status: 'drained' }; },
-  };
-}
-
-// --- forwardTransformer alone ---------------------------------------------
+// --- One pass = one encoder = one duty (installed controller) --------------
 
 {
   const counters = makeCounters();
   const device = makeFakeDevice(counters);
-  const submissions = makeSubmissions();
+  const submissions = createWebGpuBoundedSubmissionQueue({
+    queue: device.queue, maxInFlightDuties: 2,
+  });
   const out = await forwardTransformer(
     device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null,
-    { submissions },
+    { submissions, dutyId: 'g1-s1-cond-root' },
   );
-  check('with a submissions context, no direct queue.submit occurs',
-    counters.directSubmits === 0, `directSubmits=${counters.directSubmits}`);
-  check('every command buffer routes through submitDuty',
-    submissions.record.duties.length > 0
-      && submissions.record.duties.length === counters.finished,
-    `duties=${submissions.record.duties.length} finished=${counters.finished}`);
-  check('forwardTransformer emits zero host fences',
-    counters.fences === 0, `fences=${counters.fences}`);
+  check('one forward pass finishes exactly one command encoder',
+    counters.finished === 1, `finished=${counters.finished}`);
+  check('the single command buffer reaches the queue through the controller',
+    counters.queueSubmits === 1, `queueSubmits=${counters.queueSubmits}`);
   check('forwardTransformer allocates no MAP_READ buffer (debug readback gone)',
     counters.mapReadBuffers === 0, `mapReadBuffers=${counters.mapReadBuffers}`);
-  check('forwardTransformer still returns an output buffer', out != null);
+  check('forwardTransformer returns an output buffer', out != null);
+  const report = await submissions.drain();
+  check('controller drains terminal with the one duty completed',
+    report.submittedDutyCount === 1 && report.completedDutyCount === 1
+      && report.failedDutyCount === 0 && report.inFlightDutyCount === 0,
+    JSON.stringify({ s: report.submittedDutyCount, c: report.completedDutyCount }));
 }
 
 {
   const counters = makeCounters();
   const device = makeFakeDevice(counters);
   await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5);
-  check('without a submissions context, command buffers submit directly',
-    counters.directSubmits > 0 && counters.directSubmits === counters.finished,
-    `directSubmits=${counters.directSubmits} finished=${counters.finished}`);
-  check('legacy path also emits zero host fences',
-    counters.fences === 0, `fences=${counters.fences}`);
+  check('without a submissions context, the single buffer submits directly, unfenced',
+    counters.queueSubmits === 1 && counters.fences === 0 && counters.finished === 1,
+    JSON.stringify(counters));
+}
+
+// --- Duplicate duty identity must fail loud in the installed controller ----
+
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
+  const submissions = createWebGpuBoundedSubmissionQueue({
+    queue: device.queue, maxInFlightDuties: 2,
+  });
+  await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 4, 738, 5, null,
+    { submissions, dutyId: 'g1-s1-cond-root' });
+  let threw = null;
+  try {
+    await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 4, 738, 5, null,
+      { submissions, dutyId: 'g1-s1-cond-root' });
+  } catch (err) { threw = err; }
+  check('a duplicate duty id is rejected by the installed controller',
+    threw != null && /duplicate/i.test(threw.message), String(threw?.message));
 }
 
 // --- readBuffer keeps its lawful fence -------------------------------------
@@ -148,12 +157,14 @@ function makeSubmissions() {
     counters.fences === 1 && data.length === 16, `fences=${counters.fences} len=${data.length}`);
 }
 
-// --- denoiseStepWebGPU threads the context ---------------------------------
+// --- Full denoise step against the installed controller --------------------
 
 {
   const counters = makeCounters();
   const device = makeFakeDevice(counters);
-  const submissions = makeSubmissions();
+  const submissions = createWebGpuBoundedSubmissionQueue({
+    queue: device.queue, maxInFlightDuties: 2,
+  });
   const stats = {
     fps: 30,
     global_root_mean: [0, 0, 0, 0, 0], global_root_std: [1, 1, 1, 1, 1],
@@ -163,16 +174,29 @@ function makeSubmissions() {
   const motion = Array.from({ length: N }, () => new Array(369).fill(0));
   const prediction = await denoiseStepWebGPU(
     device, { root: fakeWeights(), body: fakeWeights() },
-    new Float32Array(4096), motion, 500, stats, { submissions },
+    new Float32Array(4096), motion, 500, stats,
+    { submissions, dutyPrefix: 'g1-s1' },
   );
-  check('denoise step routes all transformer work through submitDuty',
-    counters.directSubmits === 4 && submissions.record.duties.length > 0,
-    `directSubmits=${counters.directSubmits} (expect 4: one per readback) duties=${submissions.record.duties.length}`);
-  check('denoise step performs exactly its four required readbacks',
-    counters.mapReadBuffers === 4 && counters.fences === 4,
-    `mapReadBuffers=${counters.mapReadBuffers} fences=${counters.fences}`);
+  const report = await submissions.drain();
+  check('one denoise step admits exactly four duties (root/body x cond/uncond)',
+    report.submittedDutyCount === 4 && report.completedDutyCount === 4
+      && report.failedDutyCount === 0,
+    JSON.stringify({ s: report.submittedDutyCount, c: report.completedDutyCount, f: report.failedDutyCount }));
+  const ids = report.duties.map((d) => d.dutyId);
+  check('all four duty ids are unique and carry cfg-role and submodel identity',
+    new Set(ids).size === 4
+      && ids.some((i) => /cond-root/.test(i)) && ids.some((i) => /uncond-root/.test(i))
+      && ids.some((i) => /cond-body/.test(i)) && ids.some((i) => /uncond-body/.test(i)),
+    JSON.stringify(ids));
+  check('effective fence count for one step is 8 (4 controller prefix + 4 readback), not per-encoder',
+    counters.fences === 8, `fences=${counters.fences}`);
+  check('exactly eight command encoders were finished for the step (4 pass + 4 readback copies)',
+    counters.finished === 8,
+    `finished=${counters.finished}`);
   check('denoise step returns [N, 369] prediction',
     prediction.length === N && prediction[0].length === 369);
+  check('denoise step performs exactly its four required readbacks',
+    counters.mapReadBuffers === 4, `mapReadBuffers=${counters.mapReadBuffers}`);
 }
 
 process.exit(failures ? 1 : 0);

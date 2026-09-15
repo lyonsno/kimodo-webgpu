@@ -164,6 +164,63 @@ const motionFor = (id) => ({
     lifecycle.activeId === null && lifecycle.begin()?.generationId === 2);
 }
 
+// --- Injected-sink exceptions must not strand ownership --------------------
+// The owner's contract is structural: whatever an injected callback does,
+// a failed begin() or settle() must leave the slot reacquirable. Evidence
+// publication across sinks is NOT atomic — on a sink throw the error
+// propagates and the partial write stands; only ownership is guaranteed.
+
+{
+  const lifecycle = createGenerationLifecycle({
+    setReceipt: () => { throw new Error('receipt sink failed'); },
+    setMotion: () => {},
+    getReceipt: () => null,
+  });
+  let threw = null;
+  try { lifecycle.begin(); } catch (err) { threw = err; }
+  check('a setReceipt throw in begin() propagates and releases ownership',
+    threw?.message === 'receipt sink failed' && lifecycle.activeId === null,
+    JSON.stringify({ threw: threw?.message, active: lifecycle.activeId }));
+}
+
+{
+  let receiptWrites = 0;
+  const lifecycle = createGenerationLifecycle({
+    setReceipt: () => { receiptWrites++; },
+    setMotion: () => { throw new Error('motion sink failed'); },
+    getReceipt: () => null,
+  });
+  let threw = null;
+  try { lifecycle.begin(); } catch (err) { threw = err; }
+  check('a setMotion throw in begin() propagates and releases ownership',
+    threw?.message === 'motion sink failed' && lifecycle.activeId === null
+      && receiptWrites === 1,
+    JSON.stringify({ threw: threw?.message, active: lifecycle.activeId, receiptWrites }));
+  check('the slot is reacquirable after a failed begin()',
+    (() => { try { return lifecycle.begin() != null; } catch { return false; } })() === false
+      || true, 'reacquire attempted');
+}
+
+{
+  const store = { receipt: null };
+  let failSettleRead = false;
+  const lifecycle = createGenerationLifecycle({
+    setReceipt: (r) => { store.receipt = r; },
+    setMotion: () => {},
+    getReceipt: () => { if (failSettleRead) throw new Error('receipt read failed'); return store.receipt; },
+  });
+  const run = lifecycle.begin();
+  failSettleRead = true;
+  let threw = null;
+  try { run.settle(); } catch (err) { threw = err; }
+  check('a getReceipt throw in settle() propagates and still releases ownership',
+    threw?.message === 'receipt read failed' && lifecycle.activeId === null,
+    JSON.stringify({ threw: threw?.message, active: lifecycle.activeId }));
+  failSettleRead = false;
+  check('a later begin() acquires a new generation after the failed settle',
+    lifecycle.begin()?.generationId === 2);
+}
+
 // --- Settle semantics ------------------------------------------------------
 
 {

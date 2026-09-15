@@ -57,34 +57,30 @@ function positionalEncoding(maxLen, dim = D) {
  *   0.0 = attend, -1e9 = mask out. Used for CFG unconditioned pass (mask text tokens).
  */
 export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null, options = {}) {
-  // Submission pacing: with a bounded submissions context (the kit's
-  // createWebGpuBoundedSubmissionQueue shape) every command buffer is
-  // admitted through submitDuty, so depth backpressure paces the GPU.
-  // Without one, buffers submit directly. NEITHER path fences the host:
-  // queue submission order is the only correctness requirement, and the
-  // sole lawful fence lives in readBuffer at a real readback boundary.
-  // (The previous per-encoder onSubmittedWorkDone fencing cost ~70 host
-  // round-trips per forward pass — tens of thousands per generation.)
+  // ONE forward pass = ONE command encoder = ONE duty. Queue submission
+  // order is the only intra-pass correctness requirement, so nothing here
+  // fences the host; the sole lawful fence is readBuffer's, at a real
+  // readback boundary. With a bounded submissions context (the kit's
+  // controller), the single command buffer is admitted as one duty under
+  // the caller-owned identity in options.dutyId — the controller applies
+  // exactly one queue-prefix fence per duty, so fence count scales with
+  // PASSES (4 per DDIM step), not with encoders (~70 per pass, the pattern
+  // this replaced twice: first as direct host fences, then as per-encoder
+  // controller duties that recreated the same ~28k-fence generation).
+  // All intermediate buffers stay alive until the single submission and are
+  // destroyed together — transiently higher host-object count, same serial
+  // GPU-side peak.
   const submissions = options.submissions ?? null;
-  let dutySeq = 0;
-  const submit = async (encoder, phase) => {
-    const commandBuffer = encoder.finish();
-    if (submissions) {
-      await submissions.submitDuty({
-        dutyId: `fwd-${outputDim}d-t${timestep}-${phase}-${dutySeq++}`,
-        commandBuffers: [commandBuffer],
-      });
-    } else {
-      device.queue.submit([commandBuffer]);
-    }
-  };
+  if (submissions && !options.dutyId) {
+    throw new Error('a bounded submissions context requires a caller-owned unique dutyId');
+  }
   const textLen = 1;   // actual text tokens from encoder
   const numTextTokens = 50; // backbone pads to this fixed size
   const totalSeqLen = numTextTokens + 1 + 1 + seqLen; // padded_text(50) + timestep(1) + heading(1) + motion
   const prefixLen = numTextTokens + 1 + 1; // text + timestep + heading
 
   // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
-  let enc = device.createCommandEncoder();
+  const enc = device.createCommandEncoder();
   const projMotionBuf = createEmptyBuffer(device, seqLen * D * 4);
   dispatchLinear(device, enc, motionBuf, weights.inputLinear.weight, weights.inputLinear.bias, {
     numRows: seqLen, inDim: inputDim, outDim: D, outputBuf: projMotionBuf,
@@ -95,10 +91,9 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   const paddedTextInput = createEmptyBuffer(device, numTextTokens * 4096 * 4); // zero-init
   // Copy real text into first row
   enc.copyBufferToBuffer(textBuf, 0, paddedTextInput, 0, 4096 * 4);
-  await submit(enc, 'text-pad');
+  
 
   // Project all 50 tokens: [50, 4096] -> [50, D] (zeros get projected to bias)
-  enc = device.createCommandEncoder();
   const projTextBuf = createEmptyBuffer(device, numTextTokens * D * 4);
   dispatchLinear(device, enc, paddedTextInput, weights.embedText.weight, weights.embedText.bias, {
     numRows: numTextTokens, inDim: 4096, outDim: D, outputBuf: projTextBuf,
@@ -118,23 +113,21 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchLinear(device, enc, tsTemp, weights.timestepMLP.linear2.weight, weights.timestepMLP.linear2.bias, {
     numRows: 1, inDim: D, outDim: D, outputBuf: tsEmbBuf,
   });
-  await submit(enc, 'prefix-proj');
+  
 
   // Step 3b: Heading angle token — cos(0)/sin(0) projected to D
   const headingInput = new Float32Array([Math.cos(0), Math.sin(0)]); // heading=0
   const headingBuf = createStorageBuffer(device, headingInput);
   const headingProjBuf = createEmptyBuffer(device, D * 4);
-  enc = device.createCommandEncoder(); // NEW encoder — previous was finished
   dispatchLinear(device, enc, headingBuf, weights.headingLinear.weight, weights.headingLinear.bias, {
     numRows: 1, inDim: 2, outDim: D, outputBuf: headingProjBuf,
   });
-  await submit(enc, 'heading');
+  
 
   // Step 4: Concatenate [paddedText(50), timestep(1), heading(1), motion(seqLen)] -> [N, D]
   // N = totalSeqLen = 50 + 1 + 1 + seqLen
   const N = totalSeqLen;
   const xseqBuf = createEmptyBuffer(device, N * D * 4);
-  enc = device.createCommandEncoder();
   // All 50 projected text tokens (real text at pos 0, bias-only padding at pos 1-49)
   enc.copyBufferToBuffer(projTextBuf, 0, xseqBuf, 0, numTextTokens * D * 4);
   // Timestep at position 50
@@ -143,25 +136,24 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   enc.copyBufferToBuffer(headingProjBuf, 0, xseqBuf, (numTextTokens + 1) * D * 4, D * 4);
   // Motion at positions 52+
   enc.copyBufferToBuffer(projMotionBuf, 0, xseqBuf, prefixLen * D * 4, seqLen * D * 4);
-  await submit(enc, 'concat');
+  
 
   // Step 5: Add positional encoding
   const pe = positionalEncoding(N);
   const peBuf = createStorageBuffer(device, pe);
   const xseqWithPE = createEmptyBuffer(device, N * D * 4);
-  enc = device.createCommandEncoder();
   dispatchAdd(device, enc, xseqBuf, peBuf, xseqWithPE, N * D);
-  await submit(enc, 'pos-enc');
+  
 
   // Step 6: 16 Transformer Encoder Layers (post-norm)
+  const transient = [];
   let currentBuf = xseqWithPE;
 
   for (let layer = 0; layer < 16; layer++) {
     const lw = weights.layers[layer];
 
     // --- Self-attention ---
-    enc = device.createCommandEncoder();
-    const qkvBuf = createEmptyBuffer(device, N * 3 * D * 4);
+      const qkvBuf = createEmptyBuffer(device, N * 3 * D * 4);
     dispatchLinear(device, enc, currentBuf, lw.inProjW, lw.inProjB, {
       numRows: N, inDim: D, outDim: 3 * D, outputBuf: qkvBuf,
     });
@@ -171,11 +163,10 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     const kBuf = createEmptyBuffer(device, N * D * 4);
     const vBuf = createEmptyBuffer(device, N * D * 4);
     dispatchQKVSplit(device, enc, qkvBuf, qBuf, kBuf, vBuf, N, D);
-    await submit(enc, 'attn-qkv');
+    
 
     // Attention
-    enc = device.createCommandEncoder();
-    const scoresBuf = createEmptyBuffer(device, NUM_HEADS * N * N * 4);
+      const scoresBuf = createEmptyBuffer(device, NUM_HEADS * N * N * 4);
     const attnOutBuf = createEmptyBuffer(device, N * D * 4);
     dispatchAttention(device, enc, qBuf, kBuf, vBuf, scoresBuf, {
       N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: attnOutBuf,
@@ -191,19 +182,17 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     dispatchAdd(device, enc, currentBuf, attnProjBuf, residual1, N * D);
     const afterAttn = createEmptyBuffer(device, N * D * 4);
     dispatchLayerNorm(device, enc, residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: afterAttn });
-    await submit(enc, 'attn-out');
+    
 
     // --- FFN ---
-    enc = device.createCommandEncoder();
-    const ffnUp = createEmptyBuffer(device, N * FFN_DIM * 4);
+      const ffnUp = createEmptyBuffer(device, N * FFN_DIM * 4);
     dispatchLinear(device, enc, afterAttn, lw.ffn1W, lw.ffn1B, {
       numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: ffnUp,
     });
     dispatchGELU(device, enc, ffnUp, N * FFN_DIM);
-    await submit(enc, 'ffn-up');
+    
 
-    enc = device.createCommandEncoder();
-    const ffnDown = createEmptyBuffer(device, N * D * 4);
+      const ffnDown = createEmptyBuffer(device, N * D * 4);
     dispatchLinear(device, enc, ffnUp, lw.ffn2W, lw.ffn2B, {
       numRows: N, inDim: FFN_DIM, outDim: D, outputBuf: ffnDown,
     });
@@ -211,28 +200,36 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     dispatchAdd(device, enc, afterAttn, ffnDown, residual2, N * D);
     const afterFFN = createEmptyBuffer(device, N * D * 4);
     dispatchLayerNorm(device, enc, residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: afterFFN });
-    await submit(enc, 'ffn-down');
+    
 
-    // Cleanup
-    qkvBuf.destroy(); qBuf.destroy(); kBuf.destroy(); vBuf.destroy();
-    scoresBuf.destroy(); attnOutBuf.destroy(); attnProjBuf.destroy();
-    residual1.destroy(); afterAttn.destroy();
-    ffnUp.destroy(); ffnDown.destroy(); residual2.destroy();
-    if (currentBuf !== xseqWithPE) currentBuf.destroy();
+    // Destroys are deferred until after the single submission: these buffers
+    // are still referenced by commands recorded in the open encoder.
+    transient.push(qkvBuf, qBuf, kBuf, vBuf, scoresBuf, attnOutBuf, attnProjBuf,
+      residual1, afterAttn, ffnUp, ffnDown, residual2);
+    if (currentBuf !== xseqWithPE) transient.push(currentBuf);
     currentBuf = afterFFN;
   }
 
   // Step 7-8: Extract motion portion and output projection
-  enc = device.createCommandEncoder();
   const motionOutBuf = createEmptyBuffer(device, seqLen * D * 4);
   enc.copyBufferToBuffer(currentBuf, prefixLen * D * 4, motionOutBuf, 0, seqLen * D * 4);
   const finalOutBuf = createEmptyBuffer(device, seqLen * outputDim * 4);
   dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
     numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
   });
-  await submit(enc, 'output-proj');
+  
 
-  // Cleanup
+  // The pass's single submission: one command buffer, one duty.
+  const commandBuffer = enc.finish();
+  if (submissions) {
+    await submissions.submitDuty({ dutyId: options.dutyId, commandBuffers: [commandBuffer] });
+  } else {
+    device.queue.submit([commandBuffer]);
+  }
+
+  // Cleanup — safe now the commands are submitted (WebGPU defers the actual
+  // free until submitted work completes).
+  for (const buf of transient) buf.destroy();
   projMotionBuf.destroy(); paddedTextInput.destroy(); projTextBuf.destroy();
   sinEmbBuf.destroy(); tsTemp.destroy(); tsEmbBuf.destroy();
   headingBuf.destroy(); headingProjBuf.destroy();
