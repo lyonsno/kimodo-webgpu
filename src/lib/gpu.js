@@ -1,24 +1,29 @@
 /**
  * WebGPU initialization and device management.
  *
- * Device acquisition goes through @kaminos/webgpu-inference-kit: every
- * adapter limit is carried over without silent downcapping (the hand-rolled
- * predecessor forwarded six hand-picked limits), and timestamp-query is
- * negotiated ('prefer': requested when the adapter has it, cleanly absent
- * when it doesn't) — the timing authority the adaptive command-duty planner
- * can consume.
+ * Device acquisition goes through @kaminos/webgpu-inference-kit: the kit
+ * carries its six supported inference limits (maxBufferSize,
+ * maxStorageBufferBindingSize, maxComputeWorkgroupStorageSize,
+ * maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX/Y) at
+ * adapter-reported values — no smaller application caps, but also not the
+ * full WebGPU limit set — and negotiates timestamp-query ('prefer':
+ * requested when the adapter has it, cleanly absent when it doesn't), the
+ * timing authority the adaptive command-duty planner can consume.
+ *
+ * `gpu` is injectable so the delegation is testable behaviorally (the
+ * fake records the actual adapter options and device descriptor).
  */
 
 import { requestBrowserWebGpuDevice } from '@kaminos/webgpu-inference-kit';
 
-export async function initGPU() {
-  if (!navigator.gpu) {
+export async function initGPU(gpu = navigator.gpu) {
+  if (!gpu) {
     throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
   }
 
   let acquired;
   try {
-    acquired = await requestBrowserWebGpuDevice(navigator.gpu, {
+    acquired = await requestBrowserWebGpuDevice(gpu, {
       adapterOptions: { powerPreference: 'high-performance' },
       timestampQuery: 'prefer',
       label: 'kimodo-webgpu',

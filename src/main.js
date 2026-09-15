@@ -11,7 +11,7 @@ import { loadWeights } from './lib/weights.js';
 import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
-import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
+import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint, describeInvalidReceipt } from './lib/route-receipt.js';
 import { inProgressReceipt, failureReceipt, ensureTerminalReceipt, classifyGenerationState } from './lib/generation-state.js';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
@@ -42,10 +42,10 @@ async function init() {
     const { adapter, device, backendIdentity } = await initGPU();
     gpuDevice = device;
     gpuAdapter = adapter;
-    gpuBackendIdentity = captureBackendIdentity(adapter, device);
-    // The kit-negotiated identity carries what the hand-rolled capture cannot:
-    // full effective limits, feature list, and the timestamp-query verdict.
-    gpuBackendIdentity.kitIdentity = backendIdentity;
+    // The kit-negotiated identity is the receipt's backend authority (the
+    // kit's evidence consumer validates it directly); Kimodo adapter/device
+    // details and the text-embedding externality ride as additive fields.
+    gpuBackendIdentity = captureBackendIdentity(adapter, device, backendIdentity);
     statusEl.textContent = 'WebGPU ready.';
     infoEl.textContent = `GPU: ${(device.limits.maxBufferSize / 1e9).toFixed(1)} GB max buffer`;
 
@@ -362,9 +362,11 @@ async function generate() {
     console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
 
     if (receipt.status !== 'real') {
-      statusEl.textContent = `Generation produced invalid output — ${receipt.fallbackReason}`;
-      infoEl.textContent =
-        'The route ran but its output contains non-finite values, so it is not usable motion.';
+      statusEl.textContent = `Generation produced an invalid receipt — ${receipt.fallbackReason}`;
+      // Output-derived invalidity and kit/schema demotion are different
+      // failures with different remedies; describeInvalidReceipt names the
+      // actual one instead of blaming non-finite output for both.
+      infoEl.textContent = describeInvalidReceipt(receipt);
       return;
     }
 

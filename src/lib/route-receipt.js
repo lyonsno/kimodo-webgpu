@@ -23,17 +23,41 @@ const WEIGHTS_HASH_UNKNOWN = 'unknown-weights-hash';
 
 /**
  * Capture WebGPU backend identity from the device.
+ *
+ * The kit-negotiated identity is the TOP-LEVEL authority: the kit's strict
+ * evidence consumer validates receipt.backend itself, so nesting the kit
+ * identity under a legacy shape leaves every receipt classified
+ * non-authoritative (the exact defect the fresh review demonstrated).
+ * Kimodo-specific adapter/device details ride as clearly additive fields
+ * (adapterInfo, deviceInfo, externalities) that the kit validator ignores.
  */
-export function captureBackendIdentity(adapter, device) {
-  return {
+export function captureBackendIdentity(adapter, device, kitIdentity = null) {
+  const base = kitIdentity ? { ...kitIdentity } : {
+    // Legacy path (no kit negotiation): build the minimal kit-shaped
+    // identity honestly. timestampQuery 'unavailable' is the truthful floor
+    // when nobody negotiated the feature.
     kind: 'webgpu-local',
-    adapter: {
+    runtime: 'browser',
+    adapterName: adapter?.info?.description || adapter?.info?.device || adapter?.info?.vendor || 'unknown-webgpu-adapter',
+    browser: globalThis.navigator?.userAgent || null,
+    requestedFeatures: [],
+    features: Array.from(device?.features ?? []),
+    limits: {
+      maxBufferSize: device.limits.maxBufferSize,
+      maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+      maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
+    },
+    timestampQuery: 'unavailable',
+  };
+  return {
+    ...base,
+    adapterInfo: {
       vendor: adapter?.info?.vendor || 'unknown',
       architecture: adapter?.info?.architecture || 'unknown',
       device: adapter?.info?.device || 'unknown',
       description: adapter?.info?.description || 'unknown',
     },
-    device: {
+    deviceInfo: {
       maxBufferSize: device.limits.maxBufferSize,
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
       maxComputeWorkgroupSizeX: device.limits.maxComputeWorkgroupSizeX,
@@ -122,6 +146,25 @@ export function createStagedProfile() {
       };
     },
   };
+}
+
+/**
+ * User-facing explanation for an invalid receipt.
+ *
+ * Invalidity has two distinct causes with different remedies, and the UI
+ * previously explained both with the non-finite-output message — false for a
+ * kit/schema demotion whose outputs are all real. Output-derived invalidity
+ * keeps its established explanation; kit demotion names the kit's reason.
+ */
+export function describeInvalidReceipt(receipt) {
+  const badOutputs = (receipt?.outputs ?? []).filter((o) => o.status !== 'real');
+  if (badOutputs.length > 0) {
+    return 'The route ran but its output contains non-finite values, so it is not usable motion.';
+  }
+  if (receipt?.kitValidation?.ok === false) {
+    return `The route ran but its receipt failed kit validation — ${receipt.fallbackReason}.`;
+  }
+  return `Generation produced an invalid receipt — ${receipt?.fallbackReason ?? 'unknown reason'}.`;
 }
 
 /**
@@ -283,9 +326,12 @@ export async function createKimodoRouteReceipt({
     timestamp: new Date().toISOString(),
     generationId,
     backend: {
-      // The kit requires an explicit backend kind and runtime string.
+      // The kit's strict evidence consumer validates this object as a kit
+      // backend identity; callers pass the kit-negotiated identity (with
+      // additive Kimodo detail fields), and these fallbacks only backstop
+      // legacy callers.
       kind: 'webgpu-local',
-      runtime: backend?.runtime || 'browser-webgpu',
+      runtime: backend?.runtime || 'browser',
       ...backend,
     },
     model: {
