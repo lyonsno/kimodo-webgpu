@@ -64,6 +64,32 @@ export function ensureTerminalReceipt(receipt, generationId, phase = 'incomplete
  * - 'real' additionally requires the rendered canvas to be present.
  * - An unknown status terminates as failure rather than hanging.
  */
+/**
+ * Classifier for the motion export (window.__kimodoLastMotion).
+ *
+ * Motion is generation evidence with NO independent authority: it is usable
+ * only when the receipt for the SAME generation the watcher is watching is
+ * terminal-real. The same staleness rules as classifyGenerationState apply —
+ * evidence from another generation never satisfies a watcher, and a missing
+ * expectedId waits rather than blessing whatever is lying around.
+ */
+export function classifyMotionExport({ motion, receipt, expectedId }) {
+  if (!motion) return { usable: false, reason: 'no-motion' };
+  if (expectedId == null) return { usable: false, reason: 'no-expected-id' };
+  if (motion.generationId !== expectedId) return { usable: false, reason: 'stale-motion' };
+  if (!receipt || receipt.generationId !== expectedId) {
+    return { usable: false, reason: 'receipt-motion-mismatch' };
+  }
+  if (receipt.status !== 'real') {
+    return { usable: false, reason: 'receipt-not-real', status: receipt.status };
+  }
+  if (!Array.isArray(motion.motion) || motion.motion.length === 0
+      || motion.motion.length !== motion.numFrames) {
+    return { usable: false, reason: 'malformed-motion' };
+  }
+  return { usable: true };
+}
+
 export function classifyGenerationState({ receipt, expectedId, canvasPresent }) {
   if (!receipt) return { done: false, reason: 'no-receipt' };
   if (expectedId == null) return { done: false, reason: 'no-expected-id' };

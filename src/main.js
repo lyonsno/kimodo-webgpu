@@ -12,7 +12,7 @@ import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from '.
 import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
 import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
-import { inProgressReceipt, failureReceipt, ensureTerminalReceipt, classifyGenerationState } from './lib/generation-state.js';
+import { inProgressReceipt, failureReceipt, ensureTerminalReceipt, classifyGenerationState, classifyMotionExport } from './lib/generation-state.js';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
 // decide whether the generation it is watching has terminally settled. Keeping
@@ -22,6 +22,14 @@ window.__kimodoGenerationState = (expectedId) => classifyGenerationState({
   receipt: window.__kimodoLastReceipt ?? null,
   expectedId,
   canvasPresent: !!document.querySelector('#viewport canvas'),
+});
+
+// Same choke-point rule for the motion export: motion is usable only when the
+// receipt for the generation the watcher is watching is terminal-real.
+window.__kimodoMotionState = (expectedId) => classifyMotionExport({
+  motion: window.__kimodoLastMotion ?? null,
+  receipt: window.__kimodoLastReceipt ?? null,
+  expectedId,
 });
 
 const statusEl = document.getElementById('status');
@@ -129,6 +137,9 @@ async function generate() {
   // run N+1 be certified by run N's result.
   const generationId = ++generationCounter;
   window.__kimodoLastReceipt = inProgressReceipt(generationId);
+  // Motion evidence is superseded on the same boundary as the receipt: a
+  // watcher must never read run N's motion while run N+1 is in flight.
+  window.__kimodoLastMotion = null;
 
   const duration = parseFloat(document.getElementById('duration').value) || 6;
   const numSteps = parseInt(document.getElementById('steps').value) || 100;
