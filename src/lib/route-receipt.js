@@ -11,7 +11,7 @@
  * - Profile: staged timing for text-embedding, ddim-sampling, fk-decode, output-capture
  */
 
-import { WEBGPU_INFERENCE_KIT_VERSION } from '@kaminos/webgpu-inference-kit';
+import { WEBGPU_INFERENCE_KIT_VERSION, validateRouteReceipt } from '@kaminos/webgpu-inference-kit';
 
 const ROUTE_ID = 'kimodo.text-to-motion.webgpu-local.v0';
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
@@ -122,6 +122,29 @@ export function createStagedProfile() {
       };
     },
   };
+}
+
+/**
+ * Run the INSTALLED kit's validator against a receipt and record the verdict
+ * on the receipt itself. A receipt the kit rejects demotes to 'invalid' with
+ * the kit's reasons — schema drift between this app and the kit fails loud at
+ * emission time in the live app, not only in the test suite.
+ *
+ * Never upgrades: a receipt that is already non-real keeps its status; the
+ * verdict is recorded either way.
+ */
+export function applyKitValidation(receipt) {
+  const verdict = validateRouteReceipt(receipt);
+  receipt.kitValidation = {
+    ok: verdict.ok,
+    errors: verdict.ok ? [] : [...verdict.errors],
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+  };
+  if (!verdict.ok && receipt.status === 'real') {
+    receipt.status = 'invalid';
+    receipt.fallbackReason = `kit validation failed: ${verdict.errors.join('; ')}`;
+  }
+  return receipt;
 }
 
 /**
@@ -248,7 +271,7 @@ export async function createKimodoRouteReceipt({
     .map((o) => `${o.role}: ${o.invalidReason ?? 'invalid'}`);
   const allOutputsValid = invalidReasons.length === 0;
 
-  return {
+  return applyKitValidation({
     schema: 'kaminos.webgpu-route-receipt.v0',
     requestedRouteId: ROUTE_ID,
     effectiveRouteId: ROUTE_ID,
@@ -298,5 +321,5 @@ export async function createKimodoRouteReceipt({
       diffusionBackend: 'webgpu-compute-shaders',
       fkBackend: 'js-cpu',
     },
-  };
+  });
 }

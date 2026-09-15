@@ -39,10 +39,13 @@ let motionRepStats = null;
 async function init() {
   try {
     statusEl.textContent = 'Requesting WebGPU device...';
-    const { adapter, device } = await initGPU();
+    const { adapter, device, backendIdentity } = await initGPU();
     gpuDevice = device;
     gpuAdapter = adapter;
     gpuBackendIdentity = captureBackendIdentity(adapter, device);
+    // The kit-negotiated identity carries what the hand-rolled capture cannot:
+    // full effective limits, feature list, and the timestamp-query verdict.
+    gpuBackendIdentity.kitIdentity = backendIdentity;
     statusEl.textContent = 'WebGPU ready.';
     infoEl.textContent = `GPU: ${(device.limits.maxBufferSize / 1e9).toFixed(1)} GB max buffer`;
 
