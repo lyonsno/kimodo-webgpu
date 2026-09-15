@@ -175,6 +175,7 @@ async function generate() {
   // after the bounded queue exists.
   let gpuAbort = null;
   let submissions = null;
+  let gpuSubmissionSummary = null;
 
   // The settlement guard covers EVERYTHING after successful admission: a
   // synchronous throw in input reads or UI setup outside the try would
@@ -265,7 +266,6 @@ async function generate() {
       maxInFlightDuties: 2,
       signal: gpuAbort.signal,
     });
-    let gpuSubmissionSummary = null;
 
     // Client-side DDIM loop
     statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;

@@ -313,4 +313,66 @@ async function measureForward(frames, { failSubmit = false } = {}) {
     `before=${before} after=${acct.live.size}`);
 }
 
+// --- Failure-path ownership beyond the transformer -------------------------
+// r3 findings: the denoiser's own buffers (text, zero-text, root/body inputs)
+// and readBuffer's staging + the returned pass output leaked when submission
+// or readback rejected; and main.js referenced gpuSubmissionSummary outside
+// its lexical scope, replacing the original failure with a ReferenceError.
+
+{
+  // Injected submit failure through the FULL denoise step: no caller-side
+  // leak beyond persistent caches.
+  const { device, acct } = makeAccountingDevice({}, { failSubmit: true });
+  const stats = {
+    fps: 30,
+    global_root_mean: [0, 0, 0, 0, 0], global_root_std: [1, 1, 1, 1, 1],
+    local_root_mean: [0, 0, 0, 0], local_root_std: [1, 1, 1, 1],
+  };
+  const motion = Array.from({ length: 4 }, () => new Array(369).fill(0));
+  let error = null;
+  try {
+    await denoiseStepWebGPU(device, { root: fakeWeights(), body: fakeWeights() },
+      new Float32Array(16), motion, 500, stats, {});
+  } catch (err) { error = err; }
+  check('a submit failure inside the denoise step propagates',
+    /injected queue submit failure/.test(error?.message ?? ''), String(error?.message));
+  check('a failed denoise step leaks no step-owned buffers',
+    acct.live.size <= 2, `live=${acct.live.size} (persistent caches only)`);
+}
+
+{
+  // readBuffer: a rejected mapAsync must not leak the staging buffer.
+  const live = new Set();
+  const device = {
+    createBuffer: (desc) => {
+      const buf = { size: desc.size, destroy() { live.delete(buf); },
+        mapAsync: async () => { throw new Error('injected map failure'); },
+        getMappedRange: () => new ArrayBuffer(desc.size), unmap() {} };
+      live.add(buf);
+      return buf;
+    },
+    createCommandEncoder: () => ({ copyBufferToBuffer() {}, finish: () => ({}) }),
+    queue: { submit() {}, onSubmittedWorkDone: async () => {} },
+  };
+  let error = null;
+  try { await readBuffer(device, { destroy() {} }, 8); } catch (err) { error = err; }
+  check('a rejected readback propagates and destroys the staging buffer',
+    /injected map failure/.test(error?.message ?? '') && live.size === 0,
+    JSON.stringify({ error: error?.message, live: live.size }));
+}
+
+{
+  // main.js scope law: the submission-summary slot must be declared with the
+  // other hoisted queue handles, BEFORE the settlement try — the catch path
+  // assigns it.
+  const { readFileSync } = await import('node:fs');
+  const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
+  const genBody = mainSrc.slice(mainSrc.indexOf('async function generate()'));
+  const declIdx = genBody.indexOf('let gpuSubmissionSummary');
+  const tryIdx = genBody.indexOf('try {');
+  check('gpuSubmissionSummary is hoisted beside the queue handles, before the try',
+    declIdx !== -1 && tryIdx !== -1 && declIdx < tryIdx,
+    JSON.stringify({ declIdx, tryIdx }));
+}
+
 process.exit(failures ? 1 : 0);

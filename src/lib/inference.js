@@ -225,15 +225,19 @@ export async function readBuffer(device, buffer, numFloats) {
     size: numFloats * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
-  const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(buffer, 0, readBuf, 0, numFloats * 4);
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
-  await readBuf.mapAsync(GPUMapMode.READ);
-  const data = new Float32Array(readBuf.getMappedRange().slice(0));
-  readBuf.unmap();
-  readBuf.destroy();
-  return data;
+  try {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(buffer, 0, readBuf, 0, numFloats * 4);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+    return data;
+  } finally {
+    // Staging is reclaimed on every path, including a rejected map (r3).
+    readBuf.destroy();
+  }
 }
 
 /**
