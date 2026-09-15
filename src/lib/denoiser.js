@@ -66,7 +66,7 @@ export function globalRootToLocalRoot(rootFeatures, stats) {
  * Run the full TwostageDenoiser pipeline: root → local conversion → body.
  * Returns [N, 369] as nested JS arrays.
  */
-async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats) {
+async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats, options = {}) {
   const motionDim = 369;
 
   // --- Root model: input = [motion(369), zeros(369)] = [N, 738] ---
@@ -79,7 +79,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats)
   }
 
   const rootInputBuf = createStorageBuffer(device, rootInput);
-  const rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5);
+  const rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, options);
   const rootPred = await readBuffer(device, rootOutBuf, N * 5);
   rootInputBuf.destroy();
   rootOutBuf.destroy();
@@ -102,7 +102,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats)
   }
 
   const bodyInputBuf = createStorageBuffer(device, bodyInput);
-  const bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364);
+  const bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, options);
   const bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
   bodyInputBuf.destroy();
   bodyOutBuf.destroy();
@@ -124,7 +124,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats)
  * Runs the full TwostageDenoiser for conditioned and unconditioned passes,
  * then applies classifier-free guidance.
  */
-export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, timestep, stats) {
+export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, timestep, stats, options = {}) {
   const N = motion.length;
   const motionDim = 369;
 
@@ -134,10 +134,10 @@ export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, 
   const zeroTextBuf = createStorageBuffer(device, new Float32Array(textArr.length));
 
   // Conditioned pass: real text
-  const condOutput = await runTwoStage(device, weights, motion, textBuf, timestep, N, stats);
+  const condOutput = await runTwoStage(device, weights, motion, textBuf, timestep, N, stats, options);
 
   // Unconditioned pass: zeroed text
-  const uncondOutput = await runTwoStage(device, weights, motion, zeroTextBuf, timestep, N, stats);
+  const uncondOutput = await runTwoStage(device, weights, motion, zeroTextBuf, timestep, N, stats, options);
 
   textBuf.destroy();
   zeroTextBuf.destroy();

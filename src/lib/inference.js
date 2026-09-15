@@ -56,7 +56,28 @@ function positionalEncoding(maxLen, dim = D) {
  * @param {GPUBuffer|null} keyMaskBuf - optional [totalSeqLen] float buffer for attention masking.
  *   0.0 = attend, -1e9 = mask out. Used for CFG unconditioned pass (mask text tokens).
  */
-export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null) {
+export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null, options = {}) {
+  // Submission pacing: with a bounded submissions context (the kit's
+  // createWebGpuBoundedSubmissionQueue shape) every command buffer is
+  // admitted through submitDuty, so depth backpressure paces the GPU.
+  // Without one, buffers submit directly. NEITHER path fences the host:
+  // queue submission order is the only correctness requirement, and the
+  // sole lawful fence lives in readBuffer at a real readback boundary.
+  // (The previous per-encoder onSubmittedWorkDone fencing cost ~70 host
+  // round-trips per forward pass — tens of thousands per generation.)
+  const submissions = options.submissions ?? null;
+  let dutySeq = 0;
+  const submit = async (encoder, phase) => {
+    const commandBuffer = encoder.finish();
+    if (submissions) {
+      await submissions.submitDuty({
+        dutyId: `fwd-${outputDim}d-t${timestep}-${phase}-${dutySeq++}`,
+        commandBuffers: [commandBuffer],
+      });
+    } else {
+      device.queue.submit([commandBuffer]);
+    }
+  };
   const textLen = 1;   // actual text tokens from encoder
   const numTextTokens = 50; // backbone pads to this fixed size
   const totalSeqLen = numTextTokens + 1 + 1 + seqLen; // padded_text(50) + timestep(1) + heading(1) + motion
@@ -74,8 +95,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   const paddedTextInput = createEmptyBuffer(device, numTextTokens * 4096 * 4); // zero-init
   // Copy real text into first row
   enc.copyBufferToBuffer(textBuf, 0, paddedTextInput, 0, 4096 * 4);
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  await submit(enc, 'text-pad');
 
   // Project all 50 tokens: [50, 4096] -> [50, D] (zeros get projected to bias)
   enc = device.createCommandEncoder();
@@ -98,8 +118,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchLinear(device, enc, tsTemp, weights.timestepMLP.linear2.weight, weights.timestepMLP.linear2.bias, {
     numRows: 1, inDim: D, outDim: D, outputBuf: tsEmbBuf,
   });
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  await submit(enc, 'prefix-proj');
 
   // Step 3b: Heading angle token — cos(0)/sin(0) projected to D
   const headingInput = new Float32Array([Math.cos(0), Math.sin(0)]); // heading=0
@@ -109,8 +128,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchLinear(device, enc, headingBuf, weights.headingLinear.weight, weights.headingLinear.bias, {
     numRows: 1, inDim: 2, outDim: D, outputBuf: headingProjBuf,
   });
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  await submit(enc, 'heading');
 
   // Step 4: Concatenate [paddedText(50), timestep(1), heading(1), motion(seqLen)] -> [N, D]
   // N = totalSeqLen = 50 + 1 + 1 + seqLen
@@ -125,8 +143,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   enc.copyBufferToBuffer(headingProjBuf, 0, xseqBuf, (numTextTokens + 1) * D * 4, D * 4);
   // Motion at positions 52+
   enc.copyBufferToBuffer(projMotionBuf, 0, xseqBuf, prefixLen * D * 4, seqLen * D * 4);
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  await submit(enc, 'concat');
 
   // Step 5: Add positional encoding
   const pe = positionalEncoding(N);
@@ -134,16 +151,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   const xseqWithPE = createEmptyBuffer(device, N * D * 4);
   enc = device.createCommandEncoder();
   dispatchAdd(device, enc, xseqBuf, peBuf, xseqWithPE, N * D);
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
-
-  // Debug: dump xseq tokens for comparison
-  const dbgXseq = await readBuffer(device, xseqWithPE, Math.min(N * D, 53 * D));
-  console.log('[xseq] N=' + N + ' token0[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(0, 5))));
-  console.log('[xseq] token1[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(D, D+5))));
-  console.log('[xseq] token50[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(50*D, 50*D+5))));
-  if (N > 51) console.log('[xseq] token51[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(51*D, 51*D+5))));
-  if (N > 52) console.log('[xseq] token52[0:5]=' + JSON.stringify(Array.from(dbgXseq.slice(52*D, 52*D+5))));
+  await submit(enc, 'pos-enc');
 
   // Step 6: 16 Transformer Encoder Layers (post-norm)
   let currentBuf = xseqWithPE;
@@ -163,8 +171,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     const kBuf = createEmptyBuffer(device, N * D * 4);
     const vBuf = createEmptyBuffer(device, N * D * 4);
     dispatchQKVSplit(device, enc, qkvBuf, qBuf, kBuf, vBuf, N, D);
-    device.queue.submit([enc.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    await submit(enc, 'attn-qkv');
 
     // Attention
     enc = device.createCommandEncoder();
@@ -184,8 +191,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     dispatchAdd(device, enc, currentBuf, attnProjBuf, residual1, N * D);
     const afterAttn = createEmptyBuffer(device, N * D * 4);
     dispatchLayerNorm(device, enc, residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: afterAttn });
-    device.queue.submit([enc.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    await submit(enc, 'attn-out');
 
     // --- FFN ---
     enc = device.createCommandEncoder();
@@ -194,8 +200,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
       numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: ffnUp,
     });
     dispatchGELU(device, enc, ffnUp, N * FFN_DIM);
-    device.queue.submit([enc.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    await submit(enc, 'ffn-up');
 
     enc = device.createCommandEncoder();
     const ffnDown = createEmptyBuffer(device, N * D * 4);
@@ -206,8 +211,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     dispatchAdd(device, enc, afterAttn, ffnDown, residual2, N * D);
     const afterFFN = createEmptyBuffer(device, N * D * 4);
     dispatchLayerNorm(device, enc, residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: afterFFN });
-    device.queue.submit([enc.finish()]);
-    await device.queue.onSubmittedWorkDone();
+    await submit(enc, 'ffn-down');
 
     // Cleanup
     qkvBuf.destroy(); qBuf.destroy(); kBuf.destroy(); vBuf.destroy();
@@ -226,8 +230,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
     numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
   });
-  device.queue.submit([enc.finish()]);
-  await device.queue.onSubmittedWorkDone();
+  await submit(enc, 'output-proj');
 
   // Cleanup
   projMotionBuf.destroy(); paddedTextInput.destroy(); projTextBuf.destroy();

@@ -139,6 +139,7 @@ export async function createKimodoRouteReceipt({
   filmstripData,  // optional Uint8Array PNG
   weightsHash = WEIGHTS_HASH_UNKNOWN,
   generationId = null,  // binds this receipt to one generation; see main.js
+  gpuSubmission = null, // bounded-submission pacing summary; see main.js
 }) {
   const promptHash = await sha256(prompt);
   const promptId = `prompt-${promptHash.slice(0, 16)}`;
@@ -297,6 +298,7 @@ export async function createKimodoRouteReceipt({
       textEmbeddingSource: 'server-side-llama3-8b',
       diffusionBackend: 'webgpu-compute-shaders',
       fkBackend: 'js-cpu',
+      gpuSubmission,
     },
   };
 }

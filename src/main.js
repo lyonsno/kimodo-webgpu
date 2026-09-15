@@ -13,6 +13,7 @@ import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
 import { loadFKData, decodeMotion } from './lib/fk_decode.js';
 import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint } from './lib/route-receipt.js';
 import { classifyGenerationState, classifyMotionExport, createGenerationLifecycle } from './lib/generation-state.js';
+import { createWebGpuBoundedSubmissionQueue } from '@kaminos/webgpu-inference-kit';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
 // decide whether the generation it is watching has terminally settled. Keeping
@@ -160,6 +161,11 @@ async function generate() {
   generateBtn.disabled = true;
   progressBar.style.width = '0%';
 
+  // Hoisted so the catch path can stop GPU admission for failures that occur
+  // after the bounded queue exists.
+  let gpuAbort = null;
+  let submissions = null;
+
   try {
     // Route receipt profiling
     const profile = createStagedProfile();
@@ -227,6 +233,18 @@ async function generate() {
     profile.end(); // text-embedding
     profile.start('ddim-sampling');
 
+    // Bounded GPU submission: the kit's queue controller owns queue.submit
+    // and applies depth backpressure, replacing the old fence-per-encoder
+    // pattern (~29k host round-trips per 100-step generation) with paced
+    // admission. Depth 2 keeps one duty encoding while one executes.
+    gpuAbort = new AbortController();
+    submissions = createWebGpuBoundedSubmissionQueue({
+      queue: gpuDevice.queue,
+      maxInFlightDuties: 2,
+      signal: gpuAbort.signal,
+    });
+    let gpuSubmissionSummary = null;
+
     // Client-side DDIM loop
     statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;
     const t0 = performance.now();
@@ -285,8 +303,12 @@ async function generate() {
       // WebGPU denoising
       const predClean = await denoiseStepWebGPU(
         gpuDevice, modelWeights, Array.from(textEmbedding),
-        motion, useTimesteps[step], motionRepStats,
+        motion, useTimesteps[step], motionRepStats, { submissions },
       );
+      // The route's declared per-diffusion-step cooperative checkpoint: one
+      // frame yield per step guarantees paint cadence for progress UI while
+      // the bounded queue paces GPU admission within the step.
+      await new Promise(requestAnimationFrame);
 
       if (false && step === numSteps - 1) {
         // Compare raw root model forward pass (no CFG, no TwostageDenoiser)
@@ -342,6 +364,18 @@ async function generate() {
       }
     }
 
+    // Terminal drain: waits for every admitted duty's queue-prefix fence,
+    // and its report carries the pacing evidence for the receipt.
+    const submissionReport = await submissions.drain();
+    gpuSubmissionSummary = {
+      status: submissionReport.status,
+      maxInFlightDuties: submissionReport.maxInFlightDuties,
+      maxObservedInFlightDuties: submissionReport.maxObservedInFlightDuties,
+      submittedDutyCount: submissionReport.submittedDutyCount,
+      completedDutyCount: submissionReport.completedDutyCount,
+      failedDutyCount: submissionReport.failedDutyCount,
+    };
+
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
     profile.end(); // ddim-sampling
     profile.start('fk-decode');
@@ -371,6 +405,7 @@ async function generate() {
       backend: setTextEmbeddingEndpoint(gpuBackendIdentity, `${serverUrl}/embed`),
       profile,
       generationId,
+      gpuSubmission: gpuSubmissionSummary,
       weightsHash: weightsHashPromise ? await weightsHashPromise : undefined,
     });
     profile.end(); // output-capture
@@ -406,6 +441,10 @@ async function generate() {
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
+    // Stop admitting GPU work and settle what WebGPU already accepted, so a
+    // failed generation cannot leave duties silently in flight. The original
+    // error stays authoritative; drain-after-abort failures are secondary.
+    if (gpuAbort) gpuAbort.abort();
     run.publishFailure('exception', err.message);
     statusEl.textContent = `Error: ${err.message}`;
     console.error(err);
