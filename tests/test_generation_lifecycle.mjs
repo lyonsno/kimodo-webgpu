@@ -185,9 +185,10 @@ const motionFor = (id) => ({
 
 {
   let receiptWrites = 0;
+  let motionThrows = 1; // throw on the FIRST setMotion only
   const lifecycle = createGenerationLifecycle({
     setReceipt: () => { receiptWrites++; },
-    setMotion: () => { throw new Error('motion sink failed'); },
+    setMotion: () => { if (motionThrows-- > 0) throw new Error('motion sink failed'); },
     getReceipt: () => null,
   });
   let threw = null;
@@ -196,9 +197,10 @@ const motionFor = (id) => ({
     threw?.message === 'motion sink failed' && lifecycle.activeId === null
       && receiptWrites === 1,
     JSON.stringify({ threw: threw?.message, active: lifecycle.activeId, receiptWrites }));
-  check('the slot is reacquirable after a failed begin()',
-    (() => { try { return lifecycle.begin() != null; } catch { return false; } })() === false
-      || true, 'reacquire attempted');
+  const retry = lifecycle.begin();
+  check('the slot is actually reacquired after the failed begin()',
+    retry?.generationId === 2 && lifecycle.activeId === 2,
+    JSON.stringify({ id: retry?.generationId, active: lifecycle.activeId }));
 }
 
 {

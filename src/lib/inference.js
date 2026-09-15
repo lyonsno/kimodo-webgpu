@@ -62,181 +62,162 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   // fences the host; the sole lawful fence is readBuffer's, at a real
   // readback boundary. With a bounded submissions context (the kit's
   // controller), the single command buffer is admitted as one duty under
-  // the caller-owned identity in options.dutyId — the controller applies
-  // exactly one queue-prefix fence per duty, so fence count scales with
-  // PASSES (4 per DDIM step), not with encoders (~70 per pass, the pattern
-  // this replaced twice: first as direct host fences, then as per-encoder
-  // controller duties that recreated the same ~28k-fence generation).
-  // All intermediate buffers stay alive until the single submission and are
-  // destroyed together — transiently higher host-object count, same serial
-  // GPU-side peak.
+  // the caller-owned identity in options.dutyId.
+  //
+  // Memory: per-layer scratch is a FIXED set reused across all 16 layers —
+  // serial queue order makes reuse safe, so peak per-pass scratch is one
+  // layer's working set plus the ping-pong pair (~tens of MB at the maximum
+  // supported duration), not sixteen layers' worth (~740 MB at 18s, the
+  // regression the previous revision shipped while claiming "same peak").
+  //
+  // Ownership: every per-call buffer is registered and destroyed exactly
+  // once in the finally path, whatever the controller does — a rejected
+  // submission (duplicate duty, queue failure, cancellation) must not leak
+  // the pass's allocations. The returned output escapes cleanup only after
+  // successful submission.
   const submissions = options.submissions ?? null;
   if (submissions && !options.dutyId) {
     throw new Error('a bounded submissions context requires a caller-owned unique dutyId');
   }
-  const textLen = 1;   // actual text tokens from encoder
   const numTextTokens = 50; // backbone pads to this fixed size
   const totalSeqLen = numTextTokens + 1 + 1 + seqLen; // padded_text(50) + timestep(1) + heading(1) + motion
   const prefixLen = numTextTokens + 1 + 1; // text + timestep + heading
-
-  // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
-  const enc = device.createCommandEncoder();
-  const projMotionBuf = createEmptyBuffer(device, seqLen * D * 4);
-  dispatchLinear(device, enc, motionBuf, weights.inputLinear.weight, weights.inputLinear.bias, {
-    numRows: seqLen, inDim: inputDim, outDim: D, outputBuf: projMotionBuf,
-  });
-
-  // Step 2: Create padded text [numTextTokens, 4096] — first token = real text, rest = zeros
-  // Then project ALL tokens through embed_text so bias is applied to padding positions too
-  const paddedTextInput = createEmptyBuffer(device, numTextTokens * 4096 * 4); // zero-init
-  // Copy real text into first row
-  enc.copyBufferToBuffer(textBuf, 0, paddedTextInput, 0, 4096 * 4);
-  
-
-  // Project all 50 tokens: [50, 4096] -> [50, D] (zeros get projected to bias)
-  const projTextBuf = createEmptyBuffer(device, numTextTokens * D * 4);
-  dispatchLinear(device, enc, paddedTextInput, weights.embedText.weight, weights.embedText.bias, {
-    numRows: numTextTokens, inDim: 4096, outDim: D, outputBuf: projTextBuf,
-  });
-
-  // Step 3: Timestep MLP — sinusoidal -> Linear -> SiLU -> Linear
-  const sinEmb = sinusoidalEmbedding(timestep);
-  const sinEmbBuf = createStorageBuffer(device, sinEmb);
-  const tsTemp = createEmptyBuffer(device, D * 4);
-  dispatchLinear(device, enc, sinEmbBuf, weights.timestepMLP.linear1.weight, weights.timestepMLP.linear1.bias, {
-    numRows: 1, inDim: D, outDim: D, outputBuf: tsTemp,
-  });
-  // (projTextBuf is dispatched but not submitted yet — will submit with timestep)
-
-  dispatchSiLU(device, enc, tsTemp, D);
-  const tsEmbBuf = createEmptyBuffer(device, D * 4);
-  dispatchLinear(device, enc, tsTemp, weights.timestepMLP.linear2.weight, weights.timestepMLP.linear2.bias, {
-    numRows: 1, inDim: D, outDim: D, outputBuf: tsEmbBuf,
-  });
-  
-
-  // Step 3b: Heading angle token — cos(0)/sin(0) projected to D
-  const headingInput = new Float32Array([Math.cos(0), Math.sin(0)]); // heading=0
-  const headingBuf = createStorageBuffer(device, headingInput);
-  const headingProjBuf = createEmptyBuffer(device, D * 4);
-  dispatchLinear(device, enc, headingBuf, weights.headingLinear.weight, weights.headingLinear.bias, {
-    numRows: 1, inDim: 2, outDim: D, outputBuf: headingProjBuf,
-  });
-  
-
-  // Step 4: Concatenate [paddedText(50), timestep(1), heading(1), motion(seqLen)] -> [N, D]
-  // N = totalSeqLen = 50 + 1 + 1 + seqLen
   const N = totalSeqLen;
-  const xseqBuf = createEmptyBuffer(device, N * D * 4);
-  // All 50 projected text tokens (real text at pos 0, bias-only padding at pos 1-49)
-  enc.copyBufferToBuffer(projTextBuf, 0, xseqBuf, 0, numTextTokens * D * 4);
-  // Timestep at position 50
-  enc.copyBufferToBuffer(tsEmbBuf, 0, xseqBuf, numTextTokens * D * 4, D * 4);
-  // Heading at position 51
-  enc.copyBufferToBuffer(headingProjBuf, 0, xseqBuf, (numTextTokens + 1) * D * 4, D * 4);
-  // Motion at positions 52+
-  enc.copyBufferToBuffer(projMotionBuf, 0, xseqBuf, prefixLen * D * 4, seqLen * D * 4);
-  
 
-  // Step 5: Add positional encoding
-  const pe = positionalEncoding(N);
-  const peBuf = createStorageBuffer(device, pe);
-  const xseqWithPE = createEmptyBuffer(device, N * D * 4);
-  dispatchAdd(device, enc, xseqBuf, peBuf, xseqWithPE, N * D);
-  
-
-  // Step 6: 16 Transformer Encoder Layers (post-norm)
   const transient = [];
-  let currentBuf = xseqWithPE;
+  const own = (buf) => { transient.push(buf); return buf; };
+  let finalOutBuf = null;
+  let submitted = false;
 
-  for (let layer = 0; layer < 16; layer++) {
-    const lw = weights.layers[layer];
+  try {
+    const enc = device.createCommandEncoder();
 
-    // --- Self-attention ---
-      const qkvBuf = createEmptyBuffer(device, N * 3 * D * 4);
-    dispatchLinear(device, enc, currentBuf, lw.inProjW, lw.inProjB, {
-      numRows: N, inDim: D, outDim: 3 * D, outputBuf: qkvBuf,
+    // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
+    const projMotionBuf = own(createEmptyBuffer(device, seqLen * D * 4));
+    dispatchLinear(device, enc, motionBuf, weights.inputLinear.weight, weights.inputLinear.bias, {
+      numRows: seqLen, inDim: inputDim, outDim: D, outputBuf: projMotionBuf,
     });
 
-    // Split QKV
-    const qBuf = createEmptyBuffer(device, N * D * 4);
-    const kBuf = createEmptyBuffer(device, N * D * 4);
-    const vBuf = createEmptyBuffer(device, N * D * 4);
-    dispatchQKVSplit(device, enc, qkvBuf, qBuf, kBuf, vBuf, N, D);
-    
-
-    // Attention
-      const scoresBuf = createEmptyBuffer(device, NUM_HEADS * N * N * 4);
-    const attnOutBuf = createEmptyBuffer(device, N * D * 4);
-    dispatchAttention(device, enc, qBuf, kBuf, vBuf, scoresBuf, {
-      N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: attnOutBuf,
-      maskBuf: keyMaskBuf,
+    // Step 2: Padded text [numTextTokens, 4096] — first token real, rest zeros;
+    // ALL tokens go through embed_text so bias lands on padding too.
+    const paddedTextInput = own(createEmptyBuffer(device, numTextTokens * 4096 * 4)); // zero-init
+    enc.copyBufferToBuffer(textBuf, 0, paddedTextInput, 0, 4096 * 4);
+    const projTextBuf = own(createEmptyBuffer(device, numTextTokens * D * 4));
+    dispatchLinear(device, enc, paddedTextInput, weights.embedText.weight, weights.embedText.bias, {
+      numRows: numTextTokens, inDim: 4096, outDim: D, outputBuf: projTextBuf,
     });
 
-    // Output projection + residual + norm1
-    const attnProjBuf = createEmptyBuffer(device, N * D * 4);
-    dispatchLinear(device, enc, attnOutBuf, lw.outProjW, lw.outProjB, {
-      numRows: N, inDim: D, outDim: D, outputBuf: attnProjBuf,
+    // Step 3: Timestep MLP — sinusoidal -> Linear -> SiLU -> Linear
+    const sinEmbBuf = own(createStorageBuffer(device, sinusoidalEmbedding(timestep)));
+    const tsTemp = own(createEmptyBuffer(device, D * 4));
+    dispatchLinear(device, enc, sinEmbBuf, weights.timestepMLP.linear1.weight, weights.timestepMLP.linear1.bias, {
+      numRows: 1, inDim: D, outDim: D, outputBuf: tsTemp,
     });
-    const residual1 = createEmptyBuffer(device, N * D * 4);
-    dispatchAdd(device, enc, currentBuf, attnProjBuf, residual1, N * D);
-    const afterAttn = createEmptyBuffer(device, N * D * 4);
-    dispatchLayerNorm(device, enc, residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: afterAttn });
-    
-
-    // --- FFN ---
-      const ffnUp = createEmptyBuffer(device, N * FFN_DIM * 4);
-    dispatchLinear(device, enc, afterAttn, lw.ffn1W, lw.ffn1B, {
-      numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: ffnUp,
+    dispatchSiLU(device, enc, tsTemp, D);
+    const tsEmbBuf = own(createEmptyBuffer(device, D * 4));
+    dispatchLinear(device, enc, tsTemp, weights.timestepMLP.linear2.weight, weights.timestepMLP.linear2.bias, {
+      numRows: 1, inDim: D, outDim: D, outputBuf: tsEmbBuf,
     });
-    dispatchGELU(device, enc, ffnUp, N * FFN_DIM);
-    
 
-      const ffnDown = createEmptyBuffer(device, N * D * 4);
-    dispatchLinear(device, enc, ffnUp, lw.ffn2W, lw.ffn2B, {
-      numRows: N, inDim: FFN_DIM, outDim: D, outputBuf: ffnDown,
+    // Step 3b: Heading angle token — cos(0)/sin(0) projected to D
+    const headingBuf = own(createStorageBuffer(device, new Float32Array([Math.cos(0), Math.sin(0)])));
+    const headingProjBuf = own(createEmptyBuffer(device, D * 4));
+    dispatchLinear(device, enc, headingBuf, weights.headingLinear.weight, weights.headingLinear.bias, {
+      numRows: 1, inDim: 2, outDim: D, outputBuf: headingProjBuf,
     });
-    const residual2 = createEmptyBuffer(device, N * D * 4);
-    dispatchAdd(device, enc, afterAttn, ffnDown, residual2, N * D);
-    const afterFFN = createEmptyBuffer(device, N * D * 4);
-    dispatchLayerNorm(device, enc, residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: afterFFN });
-    
 
-    // Destroys are deferred until after the single submission: these buffers
-    // are still referenced by commands recorded in the open encoder.
-    transient.push(qkvBuf, qBuf, kBuf, vBuf, scoresBuf, attnOutBuf, attnProjBuf,
-      residual1, afterAttn, ffnUp, ffnDown, residual2);
-    if (currentBuf !== xseqWithPE) transient.push(currentBuf);
-    currentBuf = afterFFN;
+    // Step 4: Concatenate [paddedText(50), timestep(1), heading(1), motion] -> [N, D]
+    const xseqBuf = own(createEmptyBuffer(device, N * D * 4));
+    enc.copyBufferToBuffer(projTextBuf, 0, xseqBuf, 0, numTextTokens * D * 4);
+    enc.copyBufferToBuffer(tsEmbBuf, 0, xseqBuf, numTextTokens * D * 4, D * 4);
+    enc.copyBufferToBuffer(headingProjBuf, 0, xseqBuf, (numTextTokens + 1) * D * 4, D * 4);
+    enc.copyBufferToBuffer(projMotionBuf, 0, xseqBuf, prefixLen * D * 4, seqLen * D * 4);
+
+    // Step 5: Add positional encoding
+    const peBuf = own(createStorageBuffer(device, positionalEncoding(N)));
+    const xseqWithPE = own(createEmptyBuffer(device, N * D * 4));
+    dispatchAdd(device, enc, xseqBuf, peBuf, xseqWithPE, N * D);
+
+    // Step 6: 16 Transformer Encoder Layers (post-norm), fixed reused scratch.
+    // No dispatch reads and writes the same buffer; layer output ping-pongs
+    // between two dedicated buffers so layer i+1's input is never its output.
+    const scratch = {
+      qkv: own(createEmptyBuffer(device, N * 3 * D * 4)),
+      q: own(createEmptyBuffer(device, N * D * 4)),
+      k: own(createEmptyBuffer(device, N * D * 4)),
+      v: own(createEmptyBuffer(device, N * D * 4)),
+      scores: own(createEmptyBuffer(device, NUM_HEADS * N * N * 4)),
+      attnOut: own(createEmptyBuffer(device, N * D * 4)),
+      attnProj: own(createEmptyBuffer(device, N * D * 4)),
+      residual1: own(createEmptyBuffer(device, N * D * 4)),
+      afterAttn: own(createEmptyBuffer(device, N * D * 4)),
+      ffnUp: own(createEmptyBuffer(device, N * FFN_DIM * 4)),
+      ffnDown: own(createEmptyBuffer(device, N * D * 4)),
+      residual2: own(createEmptyBuffer(device, N * D * 4)),
+      pingA: own(createEmptyBuffer(device, N * D * 4)),
+      pingB: own(createEmptyBuffer(device, N * D * 4)),
+    };
+    let currentBuf = xseqWithPE;
+
+    for (let layer = 0; layer < 16; layer++) {
+      const lw = weights.layers[layer];
+      const layerOut = (layer % 2 === 0) ? scratch.pingA : scratch.pingB;
+
+      // --- Self-attention ---
+      dispatchLinear(device, enc, currentBuf, lw.inProjW, lw.inProjB, {
+        numRows: N, inDim: D, outDim: 3 * D, outputBuf: scratch.qkv,
+      });
+      dispatchQKVSplit(device, enc, scratch.qkv, scratch.q, scratch.k, scratch.v, N, D);
+      dispatchAttention(device, enc, scratch.q, scratch.k, scratch.v, scratch.scores, {
+        N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: scratch.attnOut,
+        maskBuf: keyMaskBuf,
+      });
+      dispatchLinear(device, enc, scratch.attnOut, lw.outProjW, lw.outProjB, {
+        numRows: N, inDim: D, outDim: D, outputBuf: scratch.attnProj,
+      });
+      dispatchAdd(device, enc, currentBuf, scratch.attnProj, scratch.residual1, N * D);
+      dispatchLayerNorm(device, enc, scratch.residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: scratch.afterAttn });
+
+      // --- FFN ---
+      dispatchLinear(device, enc, scratch.afterAttn, lw.ffn1W, lw.ffn1B, {
+        numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: scratch.ffnUp,
+      });
+      dispatchGELU(device, enc, scratch.ffnUp, N * FFN_DIM);
+      dispatchLinear(device, enc, scratch.ffnUp, lw.ffn2W, lw.ffn2B, {
+        numRows: N, inDim: FFN_DIM, outDim: D, outputBuf: scratch.ffnDown,
+      });
+      dispatchAdd(device, enc, scratch.afterAttn, scratch.ffnDown, scratch.residual2, N * D);
+      dispatchLayerNorm(device, enc, scratch.residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: layerOut });
+
+      currentBuf = layerOut;
+    }
+
+    // Step 7-8: Extract motion portion and output projection
+    const motionOutBuf = own(createEmptyBuffer(device, seqLen * D * 4));
+    enc.copyBufferToBuffer(currentBuf, prefixLen * D * 4, motionOutBuf, 0, seqLen * D * 4);
+    finalOutBuf = createEmptyBuffer(device, seqLen * outputDim * 4);
+    dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
+      numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
+    });
+
+    // The pass's single submission: one command buffer, one duty.
+    const commandBuffer = enc.finish();
+    if (submissions) {
+      await submissions.submitDuty({ dutyId: options.dutyId, commandBuffers: [commandBuffer] });
+    } else {
+      device.queue.submit([commandBuffer]);
+    }
+    submitted = true;
+
+    return finalOutBuf;
+  } finally {
+    // Exactly-once cleanup on every path. After successful submission,
+    // destroy() is a deferred free (WebGPU retains until submitted work
+    // completes); on a failed/rejected path the never-submitted buffers,
+    // including the would-be output, are reclaimed immediately.
+    for (const buf of transient) buf.destroy();
+    if (!submitted && finalOutBuf) finalOutBuf.destroy();
   }
-
-  // Step 7-8: Extract motion portion and output projection
-  const motionOutBuf = createEmptyBuffer(device, seqLen * D * 4);
-  enc.copyBufferToBuffer(currentBuf, prefixLen * D * 4, motionOutBuf, 0, seqLen * D * 4);
-  const finalOutBuf = createEmptyBuffer(device, seqLen * outputDim * 4);
-  dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
-    numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
-  });
-  
-
-  // The pass's single submission: one command buffer, one duty.
-  const commandBuffer = enc.finish();
-  if (submissions) {
-    await submissions.submitDuty({ dutyId: options.dutyId, commandBuffers: [commandBuffer] });
-  } else {
-    device.queue.submit([commandBuffer]);
-  }
-
-  // Cleanup — safe now the commands are submitted (WebGPU defers the actual
-  // free until submitted work completes).
-  for (const buf of transient) buf.destroy();
-  projMotionBuf.destroy(); paddedTextInput.destroy(); projTextBuf.destroy();
-  sinEmbBuf.destroy(); tsTemp.destroy(); tsEmbBuf.destroy();
-  headingBuf.destroy(); headingProjBuf.destroy();
-  xseqBuf.destroy(); peBuf.destroy();
-  xseqWithPE.destroy(); motionOutBuf.destroy(); currentBuf.destroy();
-
-  return finalOutBuf;
 }
 
 export async function readBuffer(device, buffer, numFloats) {

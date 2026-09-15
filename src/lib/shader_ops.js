@@ -21,6 +21,16 @@ import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 
 const pipelineCache = new Map();
+const dummyMaskCache = new WeakMap();
+
+function cachedDummyMask(device) {
+  let buf = dummyMaskCache.get(device);
+  if (!buf) {
+    buf = createStorageBuffer(device, new Float32Array([0]));
+    dummyMaskCache.set(device, buf);
+  }
+  return buf;
+}
 const uniformCache = new Map();
 const MAX_WG_DIM = 65535;
 
@@ -322,8 +332,11 @@ export function dispatchAttention(device, encoder, qBuf, kBuf, vBuf, scoresBuf, 
   const [smWgX, smWgY] = splitWorkgroups(smWG);
   const hasMask = maskBuf ? 1 : 0;
 
-  // Dummy mask buffer (1 float) when no masking — needed for bind group layout
-  const actualMaskBuf = maskBuf || createStorageBuffer(device, new Float32Array([0]));
+  // Dummy mask buffer (1 float) when no masking — needed for bind group
+  // layout. Cached per device: the previous per-call allocation leaked one
+  // untracked 4-byte buffer per unmasked attention call (16 per forward,
+  // thousands per generation).
+  const actualMaskBuf = maskBuf || cachedDummyMask(device);
 
   const smUniform = cachedUniform(device, new Uint32Array([N, numHeads, hasMask, smWgX]));
   const smPipeline = getOrCreatePipeline(device, 'attn_softmax_masked', attentionWGSL, 'softmaxMasked');
