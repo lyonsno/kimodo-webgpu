@@ -67,6 +67,12 @@ export function globalRootToLocalRoot(rootFeatures, stats) {
  * Returns [N, 369] as nested JS arrays.
  */
 async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats, options = {}) {
+  // Caller-owned duty identity: unique per generation across steps, CFG
+  // roles, and submodels — the installed controller rejects duplicates for
+  // its lifetime, and the first cut collided cond/uncond root passes.
+  const dutyFor = (submodel) => (options.submissions
+    ? { submissions: options.submissions, dutyId: `${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}` }
+    : {});
   const motionDim = 369;
 
   // --- Root model: input = [motion(369), zeros(369)] = [N, 738] ---
@@ -79,7 +85,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   }
 
   const rootInputBuf = createStorageBuffer(device, rootInput);
-  const rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, options);
+  const rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, dutyFor('root'));
   const rootPred = await readBuffer(device, rootOutBuf, N * 5);
   rootInputBuf.destroy();
   rootOutBuf.destroy();
@@ -102,7 +108,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   }
 
   const bodyInputBuf = createStorageBuffer(device, bodyInput);
-  const bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, options);
+  const bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, dutyFor('body'));
   const bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
   bodyInputBuf.destroy();
   bodyOutBuf.destroy();
@@ -134,10 +140,10 @@ export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, 
   const zeroTextBuf = createStorageBuffer(device, new Float32Array(textArr.length));
 
   // Conditioned pass: real text
-  const condOutput = await runTwoStage(device, weights, motion, textBuf, timestep, N, stats, options);
+  const condOutput = await runTwoStage(device, weights, motion, textBuf, timestep, N, stats, { ...options, cfgRole: 'cond' });
 
   // Unconditioned pass: zeroed text
-  const uncondOutput = await runTwoStage(device, weights, motion, zeroTextBuf, timestep, N, stats, options);
+  const uncondOutput = await runTwoStage(device, weights, motion, zeroTextBuf, timestep, N, stats, { ...options, cfgRole: 'uncond' });
 
   textBuf.destroy();
   zeroTextBuf.destroy();

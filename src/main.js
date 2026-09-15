@@ -132,6 +132,24 @@ let weightsHashPromise = null;
 // admission plus ownership-checked publication. generate() is globally
 // callable (window.generate), so the overlap policy must live at this
 // boundary, not in DOM button state.
+// Honest projection of a bounded-submission report for receipt/failure
+// evidence: counts and terminal status, not the uncapped duty ledger.
+function summarizeSubmissionReport(report, error = null) {
+  if (!report) {
+    return error ? { status: 'unreported', error: String(error?.message ?? error) } : null;
+  }
+  return {
+    status: report.status,
+    maxInFlightDuties: report.maxInFlightDuties,
+    maxObservedInFlightDuties: report.maxObservedInFlightDuties,
+    submittedDutyCount: report.submittedDutyCount,
+    completedDutyCount: report.completedDutyCount,
+    failedDutyCount: report.failedDutyCount,
+    inFlightDutyCount: report.inFlightDutyCount,
+    ...(error ? { drainError: String(error?.message ?? error) } : {}),
+  };
+}
+
 const generationLifecycle = createGenerationLifecycle({
   setReceipt: (r) => { window.__kimodoLastReceipt = r; },
   setMotion: (m) => { window.__kimodoLastMotion = m; },
@@ -310,7 +328,10 @@ async function generate() {
       // WebGPU denoising
       const predClean = await denoiseStepWebGPU(
         gpuDevice, modelWeights, Array.from(textEmbedding),
-        motion, useTimesteps[step], motionRepStats, { submissions },
+        motion, useTimesteps[step], motionRepStats,
+        // Duty identity: unique per generation/step; denoiser appends
+        // cfg-role and submodel. The controller rejects duplicates.
+        { submissions, dutyPrefix: `g${generationId}-s${numSteps - step}` },
       );
       // The route's declared per-diffusion-step cooperative checkpoint: one
       // frame yield per step guarantees paint cadence for progress UI while
@@ -374,14 +395,7 @@ async function generate() {
     // Terminal drain: waits for every admitted duty's queue-prefix fence,
     // and its report carries the pacing evidence for the receipt.
     const submissionReport = await submissions.drain();
-    gpuSubmissionSummary = {
-      status: submissionReport.status,
-      maxInFlightDuties: submissionReport.maxInFlightDuties,
-      maxObservedInFlightDuties: submissionReport.maxObservedInFlightDuties,
-      submittedDutyCount: submissionReport.submittedDutyCount,
-      completedDutyCount: submissionReport.completedDutyCount,
-      failedDutyCount: submissionReport.failedDutyCount,
-    };
+    gpuSubmissionSummary = summarizeSubmissionReport(submissionReport);
 
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
     profile.end(); // ddim-sampling
@@ -450,11 +464,24 @@ async function generate() {
     statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
 
   } catch (err) {
-    // Stop admitting GPU work and settle what WebGPU already accepted, so a
-    // failed generation cannot leave duties silently in flight. The original
-    // error stays authoritative; drain-after-abort failures are secondary.
+    // Stop admitting GPU work, then WAIT for the controller to reach a
+    // terminal state before ownership is released in finally: aborting alone
+    // leaves accepted duties tracked in flight, and the next generation must
+    // not begin while this one's work is unsettled. The original error stays
+    // authoritative; the terminal (or failed-drain) report rides the failure
+    // evidence so cancellation, submission failure, completion failure, and
+    // caller-side exceptions stay distinguishable.
     if (gpuAbort) gpuAbort.abort();
-    run.publishFailure('exception', err.message);
+    if (submissions) {
+      try {
+        const report = await submissions.drain();
+        gpuSubmissionSummary = summarizeSubmissionReport(report);
+      } catch (drainErr) {
+        gpuSubmissionSummary = summarizeSubmissionReport(
+          drainErr?.boundedGpuSubmissionReport ?? null, drainErr);
+      }
+    }
+    run.publishFailure('exception', err.message, { gpuSubmission: gpuSubmissionSummary });
     statusEl.textContent = `Error: ${err.message}`;
     console.error(err);
   } finally {

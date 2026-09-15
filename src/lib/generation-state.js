@@ -30,12 +30,13 @@ export function inProgressReceipt(generationId) {
 }
 
 /** Terminal failure evidence for one generation: phase names the boundary that failed. */
-export function failureReceipt(generationId, phase, reason) {
+export function failureReceipt(generationId, phase, reason, detail = null) {
   return {
     status: 'failed',
     generationId,
     phase,
     reason: String(reason ?? ''),
+    ...(detail ? { detail } : {}),
     createdAt: new Date().toISOString(),
   };
 }
@@ -93,15 +94,23 @@ export function createGenerationLifecycle({ setReceipt, setMotion, getReceipt })
       if (activeId != null) return null;
       const id = ++counter;
       activeId = id;
-      setReceipt(inProgressReceipt(id));
-      // Motion evidence is superseded on the same boundary as the receipt.
-      setMotion(null);
+      // Injected sinks may throw. Publication across sinks is NOT atomic —
+      // a partial write stands and the error propagates — but ownership must
+      // never be stranded: a failed begin() releases the slot.
+      try {
+        setReceipt(inProgressReceipt(id));
+        // Motion evidence is superseded on the same boundary as the receipt.
+        setMotion(null);
+      } catch (err) {
+        activeId = null;
+        throw err;
+      }
       const owns = () => activeId === id;
       return {
         generationId: id,
-        publishFailure(phase, reason) {
+        publishFailure(phase, reason, detail = null) {
           if (!owns()) return false;
-          setReceipt(failureReceipt(id, phase, reason));
+          setReceipt(failureReceipt(id, phase, reason, detail));
           return true;
         },
         publishSuccess(receipt, motion) {
@@ -112,8 +121,13 @@ export function createGenerationLifecycle({ setReceipt, setMotion, getReceipt })
         },
         settle() {
           if (!owns()) return false;
-          setReceipt(ensureTerminalReceipt(getReceipt(), id));
-          activeId = null;
+          // Ownership release must survive a throwing sink or reader: the
+          // error stays observable, the slot does not stay occupied.
+          try {
+            setReceipt(ensureTerminalReceipt(getReceipt(), id));
+          } finally {
+            activeId = null;
+          }
           return true;
         },
       };
