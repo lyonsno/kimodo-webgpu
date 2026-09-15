@@ -45,7 +45,14 @@ const motionFor = (id) => ({
 {
   const { store, sinks } = makeStore();
   const lifecycle = createGenerationLifecycle(sinks);
+  // Seed USABLE prior evidence before the first begin(): the review's
+  // clear-motion mutant (setMotion(null) deleted from begin()) passed the
+  // whole suite because every store started at motion === null.
+  store.receipt = realReceipt(0);
+  store.motion = motionFor(0);
   const run1 = lifecycle.begin();
+  check('begin() clears seeded prior motion before any await',
+    store.motion === null, JSON.stringify(store.motion));
   check('first begin() starts generation 1 and installs in-progress evidence',
     run1?.generationId === 1 && store.receipt?.status === 'in-progress'
       && store.receipt?.generationId === 1 && store.motion === null,
@@ -114,6 +121,49 @@ const motionFor = (id) => ({
     classifyMotionExport({ motion: store.motion, receipt: store.receipt, expectedId: 2 }).usable === true);
 }
 
+// --- Natural supersession: published motion must clear on next begin() -----
+
+{
+  const { store, sinks } = makeStore();
+  const lifecycle = createGenerationLifecycle(sinks);
+  const runN = lifecycle.begin();
+  runN.publishSuccess(realReceipt(1), motionFor(1));
+  runN.settle();
+  check('after settle, generation 1 motion is readable', store.motion?.generationId === 1);
+  lifecycle.begin();
+  check('the next begin() supersedes generation 1 motion synchronously',
+    store.motion === null && store.receipt?.status === 'in-progress'
+      && store.receipt?.generationId === 2,
+    JSON.stringify({ motion: store.motion, receipt: store.receipt }));
+}
+
+// --- Post-admission synchronous failure must not strand the owner ----------
+
+{
+  // The generate() pattern: begin(), then synchronous setup inside try with
+  // settle() in finally. A sync throw after admission must leave terminal
+  // evidence and a reusable slot — the review demonstrated that setup code
+  // OUTSIDE the try permanently stranded single-flight admission.
+  const { store, sinks } = makeStore();
+  const lifecycle = createGenerationLifecycle(sinks);
+  const run = lifecycle.begin();
+  let caught = null;
+  try {
+    throw new Error('synchronous post-admission setup failure');
+  } catch (err) {
+    caught = err;
+    run.publishFailure('exception', err.message);
+  } finally {
+    run.settle();
+  }
+  check('sync post-admission failure leaves terminal failure evidence',
+    caught != null && store.receipt?.status === 'failed'
+      && store.receipt?.phase === 'exception',
+    JSON.stringify(store.receipt));
+  check('slot is reusable after a sync post-admission failure',
+    lifecycle.activeId === null && lifecycle.begin()?.generationId === 2);
+}
+
 // --- Settle semantics ------------------------------------------------------
 
 {
@@ -151,6 +201,18 @@ const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8')
 
 check('main.js constructs the lifecycle owner over the window evidence globals',
   mainSrc.includes('createGenerationLifecycle'));
+
+{
+  // F2 witness (routing side): after admission, the settlement guard must
+  // open before ANY further synchronous setup — a throw between begin() and
+  // try{} would strand the single-flight owner for the page's lifetime.
+  const genBody = mainSrc.slice(mainSrc.indexOf('generationLifecycle.begin()'));
+  const tryIdx = genBody.indexOf('try {');
+  const firstSetupIdx = genBody.indexOf('document.getElementById');
+  check('generate() opens its settlement guard before any post-admission setup',
+    tryIdx !== -1 && firstSetupIdx !== -1 && tryIdx < firstSetupIdx,
+    JSON.stringify({ tryIdx, firstSetupIdx }));
+}
 
 check('main.js no longer assigns generation evidence directly',
   !/generationCounter/.test(mainSrc)

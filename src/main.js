@@ -153,20 +153,24 @@ async function generate() {
   }
   const { generationId } = run;
 
-  const duration = parseFloat(document.getElementById('duration').value) || 6;
-  const numSteps = parseInt(document.getElementById('steps').value) || 100;
-  const numFrames = Math.round(duration * modelConfig.fps);
-  const serverUrl = document.getElementById('server-url').value.trim();
-
-  generateBtn.disabled = true;
-  progressBar.style.width = '0%';
-
   // Hoisted so the catch path can stop GPU admission for failures that occur
   // after the bounded queue exists.
   let gpuAbort = null;
   let submissions = null;
 
+  // The settlement guard covers EVERYTHING after successful admission: a
+  // synchronous throw in input reads or UI setup outside the try would
+  // otherwise strand the single-flight owner permanently (in-progress
+  // receipt, occupied slot, every later generate() rejected).
   try {
+    const duration = parseFloat(document.getElementById('duration').value) || 6;
+    const numSteps = parseInt(document.getElementById('steps').value) || 100;
+    const numFrames = Math.round(duration * modelConfig.fps);
+    const serverUrl = document.getElementById('server-url').value.trim();
+
+    generateBtn.disabled = true;
+    progressBar.style.width = '0%';
+
     // Route receipt profiling
     const profile = createStagedProfile();
     profile.start('text-embedding');
