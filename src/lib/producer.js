@@ -108,11 +108,19 @@ function destroyOwned(node, seen = new Set()) {
  * @param {GPUDevice} input.device            borrowed; never destroyed
  * @param {GPUQueue}  [input.queue]           defaults to device.queue
  * @param {string}    input.embedUrl          POST {prompt} -> {embedding: float[text_dim]}
- * @param {Function}  [input.fetch]           fetch implementation (defaults to global)
- * @param {string}    [input.assetBase]       base URL for kimodo.json / kimodo.bin / fk_data.json / motion_rep_stats.json
+ * @param {Function}  [input.fetch]           fetch implementation used for EVERY request the
+ *                                            producer makes (all four assets and the embedding
+ *                                            endpoint); defaults to global fetch
+ * @param {string}    [input.assetBase]       base URL for kimodo.json / kimodo.bin / fk_data.json / motion_rep_stats.json;
+ *                                            weights loaded this way are producer-owned
  * @param {object}    [input.backendIdentity] host-provided kit backend identity (borrowed context)
  * @param {object}    [input.adapter]         optional adapter for legacy identity capture
- * @param {object}    [input.assets]          preloaded {config, fkData, motionRepStats, weights, weightsHash}
+ * @param {object}    [input.assets]          preloaded {config, fkData, motionRepStats, weights, weightsHash,
+ *                                            transferWeightsOwnership}. Preloaded weights stay BORROWED
+ *                                            (dispose() leaves them alone) unless transferWeightsOwnership
+ *                                            is exactly true. A missing weightsHash yields the honest
+ *                                            sentinel 'unknown-weights-hash' in identity and receipts —
+ *                                            it is not a resolved weight identity.
  * @param {Function}  [input.onLoadProgress]  ({loaded, total}) during weight download
  */
 export async function createKimodoProducer(input = {}) {
@@ -127,9 +135,14 @@ export async function createKimodoProducer(input = {}) {
   const assetBase = (input.assetBase ?? '').replace(/\/$/, '');
 
   let config, fkData, motionRepStats, weights, weightsHash;
+  // Ownership is explicit, never inferred: weights the producer loads are
+  // producer-owned; caller-supplied weights stay borrowed unless the caller
+  // transfers them (assets.transferWeightsOwnership === true).
+  let ownsWeights = false;
   if (input.assets) {
     ({ config, fkData, motionRepStats, weights } = input.assets);
     weightsHash = input.assets.weightsHash ?? 'unknown-weights-hash';
+    ownsWeights = input.assets.transferWeightsOwnership === true;
     if (!config || !fkData || !motionRepStats || !weights) {
       throw new KimodoProducerError('init', 'assets must supply config, fkData, motionRepStats, and weights');
     }
@@ -138,8 +151,10 @@ export async function createKimodoProducer(input = {}) {
     const cfgResp = await fetchImpl(`${assetBase}/kimodo.json`);
     if (!cfgResp?.ok) throw new KimodoProducerError('load-config', `could not load ${assetBase}/kimodo.json`);
     config = await cfgResp.json();
-    await loadFKData(`${assetBase}/fk_data.json`);
-    motionRepStats = await loadMotionRepStats(`${assetBase}/motion_rep_stats.json`);
+    try { await loadFKData(`${assetBase}/fk_data.json`, fetchImpl); }
+    catch (err) { throw new KimodoProducerError('load-fk', err.message); }
+    try { motionRepStats = await loadMotionRepStats(`${assetBase}/motion_rep_stats.json`, fetchImpl); }
+    catch (err) { throw new KimodoProducerError('load-stats', err.message); }
 
     const resp = await fetchImpl(`${assetBase}/kimodo.bin`);
     if (!resp?.ok) throw new KimodoProducerError('load-weights', `could not load ${assetBase}/kimodo.bin`);
@@ -160,11 +175,13 @@ export async function createKimodoProducer(input = {}) {
     for (const chunk of chunks) { view.set(chunk, offset); offset += chunk.byteLength; }
     // Identity of the weights actually consumed, from the bytes themselves.
     weightsHash = await sha256Hex(buffer);
-    weights = await loadWeights(device, buffer);
+    try { weights = await loadWeights(device, buffer); }
+    catch (err) { throw new KimodoProducerError('load-weights', err.message); } // loadWeights rolled back its own buffers
+    ownsWeights = true;
   }
 
   const identity = Object.freeze({
-    model: { id: MODEL_ID, revision: MODEL_REVISION, dtype: 'fp16', weightsHash },
+    model: Object.freeze({ id: MODEL_ID, revision: MODEL_REVISION, dtype: 'fp16', weightsHash }),
     kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
     embedUrl: input.embedUrl,
     assetBase,
@@ -177,15 +194,19 @@ export async function createKimodoProducer(input = {}) {
   let disposed = false;
   let generationCounter = 0;
 
-  async function fetchEmbedding(prompt, embedUrl = input.embedUrl) {
+  async function fetchEmbedding(prompt, embedUrl = input.embedUrl, signal = null) {
     let resp;
     try {
       resp = await fetchImpl(embedUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
+        ...(signal ? { signal } : {}),
       });
     } catch (netErr) {
+      if (signal?.aborted || netErr?.name === 'AbortError') {
+        throw new KimodoProducerError('cancelled', 'generation cancelled by caller (AbortSignal) during text embedding');
+      }
       throw new KimodoProducerError('embedding-unreachable', `cannot reach ${embedUrl}: ${netErr.message}`);
     }
     if (!resp.ok) throw new KimodoProducerError('embedding-http', `${embedUrl} responded ${resp.status} ${resp.statusText}`);
@@ -219,26 +240,60 @@ export async function createKimodoProducer(input = {}) {
 
     const profile = createStagedProfile();
 
-    stage('text-embedding', 'start');
-    profile.start('text-embedding');
-    const textEmbedding = await fetchEmbedding(prompt, embedUrl);
-    profile.end();
-    stage('text-embedding', 'end');
+    // Cancellation governs the WHOLE operation: a pre-aborted signal does no
+    // work at all, the embedding fetch carries the signal, every awaited host
+    // hook is raced against abort, and the abort bridge to the controller
+    // is installed once and removed on every exit.
     checkCancelled();
-
-    stage('ddim-sampling', 'start');
-    profile.start('ddim-sampling');
     const gpuAbort = new AbortController();
-    if (signal) signal.addEventListener('abort', () => gpuAbort.abort(), { once: true });
-    const submissions = createWebGpuBoundedSubmissionQueue({
-      queue,
-      maxInFlightDuties: opts.maxInFlightDuties ?? 2,
-      signal: gpuAbort.signal,
-    });
-    const hostSubmit = (commandBuffers) => queue.submit(commandBuffers);
+    const onAbort = () => gpuAbort.abort();
+    if (signal) signal.addEventListener('abort', onAbort);
+    const cancelledError = () => new KimodoProducerError('cancelled', 'generation cancelled by caller (AbortSignal)');
+    const raceAbort = (promise) => {
+      if (!signal) return promise;
+      return new Promise((resolve, reject) => {
+        const onAbortRace = () => reject(cancelledError());
+        if (signal.aborted) return onAbortRace();
+        signal.addEventListener('abort', onAbortRace, { once: true });
+        Promise.resolve(promise).then(
+          (v) => { signal.removeEventListener('abort', onAbortRace); resolve(v); },
+          (e) => { signal.removeEventListener('abort', onAbortRace); reject(e); },
+        );
+      });
+    };
+
+    // Host submissions through the boundary are tracked (queue-prefix fence
+    // captured per submit) and revocable: after the generation ends — success
+    // or failure — a retained submit capability throws instead of touching
+    // the shared queue, and on failure the producer waits for the host's
+    // accepted work to fence before rejecting.
+    const hostFences = [];
+    let boundaryOpen = false;
+    const hostSubmit = (commandBuffers) => {
+      if (!boundaryOpen) throw new Error('kimodo foreground boundary is closed: submit capability revoked');
+      queue.submit(commandBuffers);
+      hostFences.push(Promise.resolve(queue.onSubmittedWorkDone()).catch(() => null));
+    };
+
     let gpuSubmissionSummary = null;
     let motion;
+    let submissions = null;
     try {
+      stage('text-embedding', 'start');
+      profile.start('text-embedding');
+      const textEmbedding = await fetchEmbedding(prompt, embedUrl, signal);
+      profile.end();
+      stage('text-embedding', 'end');
+      checkCancelled();
+
+      stage('ddim-sampling', 'start');
+      profile.start('ddim-sampling');
+      submissions = createWebGpuBoundedSubmissionQueue({
+        queue,
+        maxInFlightDuties: opts.maxInFlightDuties ?? 2,
+        signal: gpuAbort.signal,
+      });
+      boundaryOpen = true;
       const sched = ddimSchedule(numSteps);
       motion = gaussianNoise(numFrames);
       const textArr = Array.from(textEmbedding);
@@ -253,10 +308,10 @@ export async function createKimodoProducer(input = {}) {
             // Foreground-opportunity boundary between admitted duties: the
             // host may submit its own work on the shared queue here.
             afterPass: opts.foregroundOpportunity
-              ? ({ pass }) => opts.foregroundOpportunity({
+              ? ({ pass }) => raceAbort(opts.foregroundOpportunity({
                 submit: hostSubmit, signal: gpuAbort.signal,
                 phase: 'ddim-sampling', step: n, numSteps, pass,
-              })
+              }))
               : undefined,
           },
         );
@@ -269,21 +324,30 @@ export async function createKimodoProducer(input = {}) {
             motion[f][d] = predClean[f][d] * Math.sqrt(alphaBarPrev) + Math.sqrt(1 - alphaBarPrev) * eps;
           }
         }
-        await opts.onProgress?.({ step: n, numSteps, pct: Math.round(100 * n / numSteps) });
+        if (opts.onProgress) await raceAbort(opts.onProgress({ step: n, numSteps, pct: Math.round(100 * n / numSteps) }));
       }
+      boundaryOpen = false;
       const report = await submissions.drain();
-      gpuSubmissionSummary = summarizeSubmissionReport(report);
+      gpuSubmissionSummary = { ...summarizeSubmissionReport(report), hostSubmissionCount: hostFences.length };
     } catch (err) {
-      // Stop admission and settle accepted duties before surfacing; the
-      // original error stays authoritative, the drain report is evidence.
+      // Stop admission, revoke the host's submit, settle accepted producer
+      // duties AND the host's accepted work before surfacing; the original
+      // error stays authoritative, the reports are evidence.
+      boundaryOpen = false;
       gpuAbort.abort();
-      try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
-      catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
+      if (submissions) {
+        try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
+        catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
+      }
+      await Promise.allSettled(hostFences);
+      if (gpuSubmissionSummary) gpuSubmissionSummary.hostSubmissionCount = hostFences.length;
       if (err instanceof KimodoProducerError) { err.gpuSubmission = gpuSubmissionSummary; throw err; }
       const wrapped = new KimodoProducerError(err?.name === 'AbortError' ? 'cancelled' : 'ddim-sampling', err?.message ?? String(err));
       wrapped.cause = err;
       wrapped.gpuSubmission = gpuSubmissionSummary;
       throw wrapped;
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
     profile.end();
     stage('ddim-sampling', 'end');
@@ -335,9 +399,10 @@ export async function createKimodoProducer(input = {}) {
   function dispose() {
     if (disposed) return;
     disposed = true;
-    // Producer-owned GPU resources only: the model weights this producer
-    // uploaded. The device belongs to the host.
-    destroyOwned(weights);
+    // Producer-owned GPU resources only: weights this producer uploaded (or
+    // was explicitly handed ownership of). Borrowed weights and the device
+    // belong to the host.
+    if (ownsWeights) destroyOwned(weights);
   }
 
   return { identity, generate, dispose };

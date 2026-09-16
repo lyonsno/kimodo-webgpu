@@ -14,8 +14,10 @@ export function setFKData(data) {
   fkData = data;
 }
 
-export async function loadFKData(url = '/fk_data.json') {
-  fkData = await (await fetch(url)).json();
+export async function loadFKData(url = '/fk_data.json', fetchImpl = globalThis.fetch) {
+  const resp = await fetchImpl(url);
+  if (!resp?.ok) throw new Error(`could not load ${url}: ${resp?.status ?? 'no response'}`);
+  fkData = await resp.json();
   console.log(`[fk] Loaded: ${fkData.num_joints} joints, ${fkData.joint_names.length} names`);
   return fkData;
 }

@@ -90,10 +90,17 @@ export async function loadWeights(device, buffer) {
   const { tensors, numTensors } = parseHeader(buffer);
   console.log(`[weights] Parsed ${numTensors} tensors`);
 
+  // Every buffer created here is tracked so a failure part-way (missing
+  // tensor, allocation or upload error) rolls back what was already created
+  // instead of leaking it — the producer owns these and must be able to
+  // reclaim them on partial initialization.
+  const created = [];
   const get = (name) => {
     const info = tensors.get(name);
     if (!info) throw new Error(`Missing weight: ${name}`);
-    return extractGPUBuffer(device, buffer, info);
+    const buf = extractGPUBuffer(device, buffer, info);
+    created.push(buf);
+    return buf;
   };
 
   function loadTransformer(prefix) {
@@ -132,9 +139,13 @@ export async function loadWeights(device, buffer) {
     return { inputLinear, embedText, outputLinear, headingLinear, timestepMLP, layers };
   }
 
-  const body = loadTransformer('body_model');
-  const root = loadTransformer('root_model');
-
-  console.log(`[weights] Loaded body_model (16 layers) + root_model (16 layers)`);
-  return { body, root };
+  try {
+    const body = loadTransformer('body_model');
+    const root = loadTransformer('root_model');
+    console.log(`[weights] Loaded body_model (16 layers) + root_model (16 layers)`);
+    return { body, root };
+  } catch (err) {
+    for (const buf of created) { try { buf.destroy(); } catch { /* best effort */ } }
+    throw err;
+  }
 }

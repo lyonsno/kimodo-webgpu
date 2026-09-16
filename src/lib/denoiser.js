@@ -11,8 +11,10 @@
 import { createStorageBuffer, createEmptyBuffer } from './gpu.js';
 import { forwardTransformer, readBuffer } from './inference.js';
 
-export async function loadMotionRepStats(url = '/motion_rep_stats.json') {
-  return (await fetch(url)).json();
+export async function loadMotionRepStats(url = '/motion_rep_stats.json', fetchImpl = globalThis.fetch) {
+  const resp = await fetchImpl(url);
+  if (!resp?.ok) throw new Error(`could not load ${url}: ${resp?.status ?? 'no response'}`);
+  return resp.json();
 }
 
 /**

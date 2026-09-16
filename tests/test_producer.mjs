@@ -116,6 +116,9 @@ async function makeProducer(counters, extra = {}) {
     JSON.stringify(producer.identity));
   producer.dispose();
   check('dispose never destroys the borrowed device', counters.deviceDestroyed === 0);
+  let mutated = false;
+  try { producer.identity.model.weightsHash = 'tampered'; mutated = producer.identity.model.weightsHash === 'tampered'; } catch { /* strict-mode throw also counts as protected */ }
+  check('identity is frozen through the nested model record', !mutated && Object.isFrozen(producer.identity.model));
 }
 
 // --- 2+3+4. Generation: stages, progress, boundaries, native result ---------
@@ -207,6 +210,240 @@ async function makeProducer(counters, extra = {}) {
     mainSrc.includes('createKimodoProducer') && /producer\.generate\(/.test(mainSrc));
   check('main.js no longer owns the DDIM schedule directly',
     !/alphasCumprodBase/.test(mainSrc), 'schedule must live in the producer');
+}
+
+// --- Review findings: cancellation coverage, host-submit settlement, ------
+// --- weights ownership, injected fetch on every asset --------------------
+
+function makeSignalSpy() {
+  // A fake AbortSignal that counts listeners so leaks are observable.
+  const listeners = new Set();
+  const spy = {
+    aborted: false, reason: undefined,
+    addEventListener: (type, fn) => { if (type === 'abort') listeners.add(fn); },
+    removeEventListener: (type, fn) => { if (type === 'abort') listeners.delete(fn); },
+    abort() { spy.aborted = true; for (const fn of [...listeners]) fn(); },
+    get listenerCount() { return listeners.size; },
+  };
+  return spy;
+}
+
+{
+  // Pre-aborted signal: no embedding request, immediate cancelled error.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer, embedCalls } = await makeProducer(counters);
+  const abort = new AbortController(); abort.abort();
+  let error = null;
+  try { await producer.generate({ prompt: 'x', steps: 2, duration: 0.1, signal: abort.signal }); } catch (err) { error = err; }
+  check('a pre-aborted signal does no work and fails cancelled',
+    error?.phase === 'cancelled' && embedCalls.length === 0, JSON.stringify({ phase: error?.phase, fetches: embedCalls.length }));
+}
+
+{
+  // Abort during a never-resolving embedding fetch must settle the call.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  let sawSignal = false;
+  const { producer } = await makeProducer(counters, {
+    fetch: (url, init) => new Promise((_, reject) => {
+      sawSignal = !!init.signal;
+      init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    }),
+  });
+  const abort = new AbortController();
+  const pending = producer.generate({ prompt: 'x', steps: 2, duration: 0.1, signal: abort.signal });
+  setTimeout(() => abort.abort(), 20);
+  let error = null;
+  try { await Promise.race([pending, new Promise((_, r) => setTimeout(() => r(new Error('did not settle')), 2000))]); } catch (err) { error = err; }
+  check('abort during the embedding fetch settles the generation as cancelled',
+    sawSignal && error?.phase === 'cancelled', JSON.stringify({ sawSignal, phase: error?.phase, m: error?.message }));
+}
+
+{
+  // Abort while the foreground callback never resolves: the call settles and
+  // the retained submit capability is revoked.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const abort = new AbortController();
+  let retainedSubmit = null;
+  const pending = producer.generate({
+    prompt: 'x', steps: 2, duration: 0.1, signal: abort.signal,
+    foregroundOpportunity: (b) => { retainedSubmit = b.submit; return new Promise(() => {}); },
+  });
+  setTimeout(() => abort.abort(), 50);
+  let error = null;
+  try { await Promise.race([pending, new Promise((_, r) => setTimeout(() => r(new Error('did not settle')), 3000))]); } catch (err) { error = err; }
+  let lateSubmitThrew = false;
+  try { retainedSubmit?.([{}]); } catch { lateSubmitThrew = true; }
+  check('abort while a foreground callback is pending settles the call as cancelled',
+    error?.phase === 'cancelled', JSON.stringify({ phase: error?.phase, m: error?.message }));
+  check('a retained submit capability is revoked after the generation ends',
+    retainedSubmit != null && lateSubmitThrew);
+}
+
+{
+  // Host callback submits then throws: the producer must fence the host's
+  // accepted work before rejecting, and carry the count in evidence.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const device = makeFakeDevice(counters);
+  let fences = 0; let fenceResolved = 0;
+  device.queue.onSubmittedWorkDone = async () => { fences++; await new Promise((r) => setTimeout(r, 5)); fenceResolved++; };
+  const producer = await createKimodoProducer({
+    device, embedUrl: 'http://embed.test/embed', fetch: fakeEmbedFetch([]), backendIdentity,
+    assets: { config, fkData, motionRepStats, weights: fakeWeights(), weightsHash: 'f'.repeat(64) },
+  });
+  let error = null;
+  try {
+    await producer.generate({
+      prompt: 'x', steps: 2, duration: 0.1,
+      foregroundOpportunity: (b) => { b.submit([{}]); throw new Error('host frame failed after submit'); },
+    });
+  } catch (err) { error = err; }
+  check('a callback that submits then throws surfaces as a producer failure',
+    error != null && /host frame failed/.test(error.message), String(error?.message));
+  check('the host work accepted before the throw is fenced before rejection',
+    error?.gpuSubmission?.hostSubmissionCount === 1 && fenceResolved === fences && fences >= 2,
+    JSON.stringify({ host: error?.gpuSubmission?.hostSubmissionCount, fences, fenceResolved }));
+}
+
+{
+  // Callback throws BEFORE submitting: clean failure, no host work tracked.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  let error = null;
+  try {
+    await producer.generate({ prompt: 'x', steps: 1, duration: 0.1,
+      foregroundOpportunity: () => { throw new Error('host declined'); } });
+  } catch (err) { error = err; }
+  check('a callback that throws before submitting fails with zero host submissions',
+    /host declined/.test(error?.message ?? '') && error?.gpuSubmission?.hostSubmissionCount === 0,
+    JSON.stringify({ m: error?.message, host: error?.gpuSubmission?.hostSubmissionCount }));
+}
+
+{
+  // Long-lived signal reused across successful generations must not leak
+  // abort listeners.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const spy = makeSignalSpy();
+  for (let i = 0; i < 3; i++) await producer.generate({ prompt: 'x', steps: 1, duration: 0.1, signal: spy });
+  check('abort listeners are removed after each successful generation',
+    spy.listenerCount === 0, `listeners=${spy.listenerCount}`);
+}
+
+{
+  // Ownership: caller-supplied weights are borrowed unless transferred.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const device = makeFakeDevice(counters);
+  let supplied = 0;
+  const trackedBuffer = () => ({ destroy() { supplied++; } });
+  const suppliedWeights = fakeWeights();
+  suppliedWeights.root.inputLinear.weight = trackedBuffer();
+  const borrowed = await createKimodoProducer({ device, embedUrl: 'http://e/embed', fetch: fakeEmbedFetch([]), backendIdentity,
+    assets: { config, fkData, motionRepStats, weights: suppliedWeights } });
+  borrowed.dispose();
+  check('dispose leaves caller-supplied weights untouched by default', supplied === 0, `destroyed=${supplied}`);
+  const transferred = await createKimodoProducer({ device, embedUrl: 'http://e/embed', fetch: fakeEmbedFetch([]), backendIdentity,
+    assets: { config, fkData, motionRepStats, weights: suppliedWeights, transferWeightsOwnership: true } });
+  transferred.dispose();
+  check('dispose destroys supplied weights only when ownership was explicitly transferred', supplied === 1, `destroyed=${supplied}`);
+}
+
+// A real (tiny) weight binary in the shipped format, so the assetBase path
+// is executable end to end: every tensor the loader requires, one fp32 each.
+function synthesizeWeightsBin() {
+  const names = [];
+  for (const prefix of ['body_model', 'root_model']) {
+    for (const n of ['input_linear', 'embed_text', 'output_linear', 'linear_first_heading_angle']) names.push(`${prefix}.${n}.weight`, `${prefix}.${n}.bias`);
+    names.push(`${prefix}.embed_timestep.time_embed.0.weight`, `${prefix}.embed_timestep.time_embed.0.bias`,
+      `${prefix}.embed_timestep.time_embed.2.weight`, `${prefix}.embed_timestep.time_embed.2.bias`);
+    for (let i = 0; i < 16; i++) {
+      const lp = `${prefix}.seqTransEncoder.layers.${i}`;
+      names.push(`${lp}.norm1.weight`, `${lp}.norm1.bias`, `${lp}.norm2.weight`, `${lp}.norm2.bias`,
+        `${lp}.self_attn.in_proj_weight`, `${lp}.self_attn.in_proj_bias`, `${lp}.self_attn.out_proj.weight`, `${lp}.self_attn.out_proj.bias`,
+        `${lp}.linear1.weight`, `${lp}.linear1.bias`, `${lp}.linear2.weight`, `${lp}.linear2.bias`);
+    }
+  }
+  const headerSize = 16 + names.length * 96;
+  const buf = new ArrayBuffer(headerSize + names.length * 4);
+  const view = new DataView(buf);
+  view.setUint32(0, 0x444D494B, true); view.setUint32(4, 1, true);
+  view.setUint32(8, names.length, true); view.setUint32(12, headerSize, true);
+  const enc = new TextEncoder();
+  names.forEach((name, i) => {
+    const off = 16 + i * 96;
+    new Uint8Array(buf, off, 64).set(enc.encode(name).slice(0, 63));
+    view.setUint32(off + 64, 0, true); view.setUint32(off + 68, 1, true); view.setUint32(off + 72, 1, true);
+    view.setUint32(off + 88, headerSize + i * 4, true); view.setUint32(off + 92, 4, true);
+  });
+  return buf;
+}
+
+function assetFetch(calls, { failOn = null } = {}) {
+  const bin = synthesizeWeightsBin();
+  const jsonResp = (obj) => ({ ok: true, status: 200, json: async () => obj });
+  return async (url, init) => {
+    calls.push(url);
+    if (failOn && url.endsWith(failOn)) return { ok: false, status: 500, statusText: 'boom', json: async () => ({}) };
+    if (url.endsWith('/kimodo.json')) return jsonResp(config);
+    if (url.endsWith('/fk_data.json')) return jsonResp(fkData);
+    if (url.endsWith('/motion_rep_stats.json')) return jsonResp(motionRepStats);
+    if (url.endsWith('/kimodo.bin')) {
+      let sent = false;
+      return { ok: true, status: 200, headers: { get: () => String(bin.byteLength) },
+        body: { getReader: () => ({ read: async () => sent ? { done: true } : (sent = true, { done: false, value: new Uint8Array(bin) }) }) } };
+    }
+    if (url.endsWith('/embed')) return jsonResp({ embedding: Array.from({ length: config.text_dim }, () => 0.01) });
+    return { ok: false, status: 404, statusText: 'nope', json: async () => ({}) };
+  };
+}
+
+{
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const device = makeFakeDevice(counters);
+  const calls = [];
+  const savedGlobalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('global fetch used'); };
+  let producer = null; let error = null;
+  try {
+    producer = await createKimodoProducer({ device, embedUrl: 'http://assets.test/embed', fetch: assetFetch(calls), assetBase: 'http://assets.test', backendIdentity });
+  } catch (err) { error = err; } finally { globalThis.fetch = savedGlobalFetch; }
+  check('assetBase path loads all four resources through the injected fetch only',
+    error == null && ['kimodo.json', 'fk_data.json', 'motion_rep_stats.json', 'kimodo.bin'].every((n) => calls.some((u) => u.endsWith('/' + n))),
+    JSON.stringify({ error: error?.message, calls }));
+  check('the consumed weights hash is the SHA-256 of the loaded bytes',
+    /^[0-9a-f]{64}$/.test(producer?.identity?.model?.weightsHash ?? ''), String(producer?.identity?.model?.weightsHash));
+  const destroyedBefore = counters.destroyed;
+  producer?.dispose();
+  check('dispose destroys producer-loaded weights (asset path is producer-owned)',
+    counters.destroyed > destroyedBefore, `destroyed delta=${counters.destroyed - destroyedBefore}`);
+}
+
+{
+  // Partial-initialization rollback: the loader fails part-way, every buffer
+  // it already created is destroyed, and the failure is phase-named.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const device = makeFakeDevice(counters);
+  let created = 0;
+  const origCreate = device.createBuffer;
+  device.createBuffer = (desc) => { created++; if (created === 50) throw new Error('injected allocation failure'); return origCreate(desc); };
+  let error = null;
+  try {
+    await createKimodoProducer({ device, embedUrl: 'http://assets.test/embed', fetch: assetFetch([]), assetBase: 'http://assets.test', backendIdentity });
+  } catch (err) { error = err; }
+  check('a failed weight load rolls back every buffer it created and names its phase',
+    error?.phase === 'load-weights' && counters.destroyed === 49,
+    JSON.stringify({ phase: error?.phase, created, destroyed: counters.destroyed }));
+}
+
+{
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  let error = null;
+  try {
+    await createKimodoProducer({ device: makeFakeDevice(counters), embedUrl: 'http://assets.test/embed',
+      fetch: assetFetch([], { failOn: '/motion_rep_stats.json' }), assetBase: 'http://assets.test', backendIdentity });
+  } catch (err) { error = err; }
+  check('a failing asset response is phase-named, not a raw error',
+    error?.phase === 'load-stats', JSON.stringify({ phase: error?.phase, m: error?.message }));
 }
 
 process.exit(failures ? 1 : 0);
