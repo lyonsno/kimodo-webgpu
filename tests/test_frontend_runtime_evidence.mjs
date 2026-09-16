@@ -128,6 +128,24 @@ function terminalProbe(generationId, receiptGenerationId, gpuSubmission) {
   return probe.snapshot();
 }
 
+function terminalPairProbe(receiptSubmission, explicitSubmission) {
+  const probe = createFrontendTelemetry({
+    generationId: 7,
+    numSteps: 1,
+    requestedMaxInFlightDuties: 2,
+    now: () => 0,
+  });
+  probe.succeed({
+    status: 'real',
+    generationId: 7,
+    requestedRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
+    effectiveRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
+    timings: { totalMs: 10, stages: [] },
+    metadata: receiptSubmission === undefined ? {} : { gpuSubmission: receiptSubmission },
+  }, explicitSubmission);
+  return probe.snapshot();
+}
+
 const wrongGeneration = terminalProbe(7, 8, submission);
 check('a terminal receipt from another generation cannot publish success',
   wrongGeneration.status !== 'succeeded'
@@ -200,6 +218,48 @@ check('a drained report from a different queue capacity cannot publish success',
   wrongCapacity.status !== 'succeeded'
     && wrongCapacity.failure?.code === 'submission-report-invalid',
   JSON.stringify(wrongCapacity));
+
+const explicitReplacesMissingReceiptReport = terminalPairProbe(undefined, oneStepSubmission);
+check('an explicit report cannot replace missing receipt-owned submission evidence',
+  explicitReplacesMissingReceiptReport.status !== 'succeeded'
+    && explicitReplacesMissingReceiptReport.failure?.code === 'submission-report-missing',
+  JSON.stringify(explicitReplacesMissingReceiptReport));
+
+const explicitReplacesInvalidReceiptReport = terminalPairProbe({
+  ...oneStepSubmission,
+  maxInFlightDuties: 3,
+}, oneStepSubmission);
+check('an explicit report cannot replace invalid receipt-owned submission evidence',
+  explicitReplacesInvalidReceiptReport.status !== 'succeeded'
+    && explicitReplacesInvalidReceiptReport.failure?.code === 'submission-report-invalid',
+  JSON.stringify(explicitReplacesInvalidReceiptReport));
+
+const contradictoryReportPair = terminalPairProbe(oneStepSubmission, {
+  ...oneStepSubmission,
+  maxObservedInFlightDuties: 1,
+});
+check('contradictory receipt-owned and explicit reports cannot publish success',
+  contradictoryReportPair.status !== 'succeeded'
+    && contradictoryReportPair.failure?.code === 'submission-report-mismatch',
+  JSON.stringify(contradictoryReportPair));
+
+const zeroObservedPeak = terminalPairProbe({
+  ...oneStepSubmission,
+  maxObservedInFlightDuties: 0,
+}, {
+  ...oneStepSubmission,
+  maxObservedInFlightDuties: 0,
+});
+check('a positive-duty report with zero observed peak cannot publish success',
+  zeroObservedPeak.status !== 'succeeded'
+    && zeroObservedPeak.failure?.code === 'submission-report-invalid',
+  JSON.stringify(zeroObservedPeak));
+
+const identicalReportPair = terminalPairProbe(oneStepSubmission, { ...oneStepSubmission });
+check('an identical coherent receipt/explicit report pair remains successful',
+  identicalReportPair.status === 'succeeded'
+    && identicalReportPair.failure === null,
+  JSON.stringify(identicalReportPair));
 
 const sameGenerationDrained = terminalProbe(7, 7, oneStepSubmission);
 check('a same-generation real receipt with a drained report remains successful',

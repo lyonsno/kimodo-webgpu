@@ -16,6 +16,23 @@ function frozenSnapshot(state) {
   return Object.freeze(snapshot);
 }
 
+const SUBMISSION_AUTHORITY_FIELDS = Object.freeze([
+  'status',
+  'maxInFlightDuties',
+  'maxObservedInFlightDuties',
+  'submittedDutyCount',
+  'completedDutyCount',
+  'failedDutyCount',
+  'inFlightDutyCount',
+  'hostSubmissionCount',
+]);
+
+function submissionReportsAgree(receiptReport, auxiliaryReport) {
+  return receiptReport != null
+    && auxiliaryReport != null
+    && SUBMISSION_AUTHORITY_FIELDS.every((field) => receiptReport[field] === auxiliaryReport[field]);
+}
+
 function terminalSubmissionProblem(submission, {
   expectedProducerDutyCount,
   requestedMaxInFlightDuties,
@@ -50,6 +67,7 @@ function terminalSubmissionProblem(submission, {
     || submission.maxInFlightDuties !== requestedMaxInFlightDuties
     || submission.maxObservedInFlightDuties > submission.maxInFlightDuties
     || submission.maxObservedInFlightDuties > submission.submittedDutyCount
+    || (expectedProducerDutyCount > 0 && submission.maxObservedInFlightDuties < 1)
     || submission.inFlightDutyCount !== 0
     || submission.failedDutyCount !== 0
     || submission.submittedDutyCount !== expectedProducerDutyCount
@@ -147,16 +165,17 @@ export function createFrontendTelemetry({
       updateElapsed();
     },
 
-    succeed(receipt, submission = receipt?.metadata?.gpuSubmission ?? null) {
+    succeed(receipt, auxiliarySubmission = undefined) {
       if (state.status !== 'running') return;
+      const receiptSubmission = receipt?.metadata?.gpuSubmission ?? null;
       state.currentStage = 'terminal';
       state.route = {
         requestedRouteId: receipt?.requestedRouteId ?? KIMODO_ROUTE_ID,
         effectiveRouteId: receipt?.effectiveRouteId ?? null,
         receiptStatus: receipt?.status ?? 'missing',
       };
-      state.submission = clone(submission);
-      state.scheduler.hostSubmissionCount = submission?.hostSubmissionCount ?? 0;
+      state.submission = clone(receiptSubmission);
+      state.scheduler.hostSubmissionCount = receiptSubmission?.hostSubmissionCount ?? 0;
 
       let problem = null;
       if (receipt?.status !== 'real') {
@@ -179,10 +198,17 @@ export function createFrontendTelemetry({
           actualGenerationId: receipt.generationId,
         };
       } else {
-        problem = terminalSubmissionProblem(submission, {
+        problem = terminalSubmissionProblem(receiptSubmission, {
           expectedProducerDutyCount: numSteps * 4,
           requestedMaxInFlightDuties,
         });
+        if (!problem && auxiliarySubmission !== undefined
+          && !submissionReportsAgree(receiptSubmission, auxiliarySubmission)) {
+          problem = {
+            code: 'submission-report-mismatch',
+            message: 'Auxiliary bounded-submission report contradicts the receipt-owned report.',
+          };
+        }
       }
 
       if (problem) {
