@@ -85,6 +85,7 @@ const submission = {
 };
 telemetry.succeed({
   status: 'real',
+  generationId: 7,
   requestedRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
   effectiveRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
   timings: { totalMs: 321, stages: [{ name: 'ddim-sampling', durationMs: 300 }] },
@@ -103,6 +104,67 @@ check('terminal telemetry preserves effective route and stage timing identity',
     && terminal.timings[0].name === 'ddim-sampling'
     && terminal.timings[0].durationMs === 300,
   JSON.stringify(terminal));
+
+function terminalProbe(generationId, receiptGenerationId, gpuSubmission) {
+  const probe = createFrontendTelemetry({
+    generationId,
+    numSteps: 1,
+    requestedMaxInFlightDuties: 2,
+    now: () => 0,
+  });
+  probe.succeed({
+    status: 'real',
+    generationId: receiptGenerationId,
+    requestedRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
+    effectiveRouteId: 'kimodo.text-to-motion.webgpu-local.v0',
+    timings: { totalMs: 10, stages: [] },
+    metadata: gpuSubmission === undefined ? {} : { gpuSubmission },
+  });
+  return probe.snapshot();
+}
+
+const wrongGeneration = terminalProbe(7, 8, submission);
+check('a terminal receipt from another generation cannot publish success',
+  wrongGeneration.status !== 'succeeded'
+    && wrongGeneration.failure?.code === 'receipt-generation-mismatch'
+    && wrongGeneration.failure?.expectedGenerationId === 7
+    && wrongGeneration.failure?.actualGenerationId === 8,
+  JSON.stringify(wrongGeneration));
+
+const missingSubmission = terminalProbe(7, 7, undefined);
+check('a real receipt with no bounded-submission report cannot publish success',
+  missingSubmission.status !== 'succeeded'
+    && missingSubmission.failure?.code === 'submission-report-missing',
+  JSON.stringify(missingSubmission));
+
+const activeSubmission = terminalProbe(7, 7, {
+  ...submission,
+  status: 'active',
+  completedDutyCount: 7,
+  inFlightDutyCount: 1,
+});
+check('a nonterminal bounded-submission report cannot publish success',
+  activeSubmission.status !== 'succeeded'
+    && activeSubmission.failure?.code === 'submission-report-nonterminal',
+  JSON.stringify(activeSubmission));
+
+const failedSubmission = terminalProbe(7, 7, {
+  ...submission,
+  status: 'failed',
+  completedDutyCount: 7,
+  failedDutyCount: 1,
+});
+check('a failed bounded-submission report cannot publish success',
+  failedSubmission.status !== 'succeeded'
+    && failedSubmission.failure?.code === 'submission-report-nonterminal',
+  JSON.stringify(failedSubmission));
+
+const sameGenerationDrained = terminalProbe(7, 7, submission);
+check('a same-generation real receipt with a drained report remains successful',
+  sameGenerationDrained.status === 'succeeded'
+    && sameGenerationDrained.failure === null
+    && sameGenerationDrained.submission?.status === 'drained',
+  JSON.stringify(sameGenerationDrained));
 
 const failedTelemetry = createFrontendTelemetry({
   generationId: 8,

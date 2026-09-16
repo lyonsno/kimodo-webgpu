@@ -16,6 +16,48 @@ function frozenSnapshot(state) {
   return Object.freeze(snapshot);
 }
 
+function terminalSubmissionProblem(submission) {
+  if (submission == null) {
+    return {
+      code: 'submission-report-missing',
+      message: 'Terminal bounded-submission report is missing.',
+    };
+  }
+  if (submission.status !== 'drained') {
+    return {
+      code: 'submission-report-nonterminal',
+      message: `Bounded-submission report is ${submission.status ?? 'unreported'}, not drained.`,
+    };
+  }
+
+  const countFields = [
+    'maxInFlightDuties',
+    'maxObservedInFlightDuties',
+    'submittedDutyCount',
+    'completedDutyCount',
+    'failedDutyCount',
+    'inFlightDutyCount',
+    'hostSubmissionCount',
+  ];
+  const malformed = countFields.some((field) => (
+    !Number.isSafeInteger(submission[field]) || submission[field] < 0
+  ));
+  const incoherent = !malformed && (
+    submission.maxInFlightDuties <= 0
+    || submission.maxObservedInFlightDuties > submission.maxInFlightDuties
+    || submission.inFlightDutyCount !== 0
+    || submission.failedDutyCount !== 0
+    || submission.completedDutyCount !== submission.submittedDutyCount
+  );
+  if (malformed || incoherent) {
+    return {
+      code: 'submission-report-invalid',
+      message: 'Drained bounded-submission report has missing or incoherent terminal counts.',
+    };
+  }
+  return null;
+}
+
 /**
  * Page-local runtime evidence for the exact generation the operator is
  * watching. This does not invent GPU timing: live rows record frontend stage
@@ -101,7 +143,6 @@ export function createFrontendTelemetry({
 
     succeed(receipt, submission = receipt?.metadata?.gpuSubmission ?? null) {
       if (state.status !== 'running') return;
-      state.status = receipt?.status === 'real' ? 'succeeded' : 'invalid';
       state.currentStage = 'terminal';
       state.route = {
         requestedRouteId: receipt?.requestedRouteId ?? KIMODO_ROUTE_ID,
@@ -110,8 +151,45 @@ export function createFrontendTelemetry({
       };
       state.submission = clone(submission);
       state.scheduler.hostSubmissionCount = submission?.hostSubmissionCount ?? 0;
-      state.timings = clone(receipt?.timings?.stages ?? []);
-      state.elapsedMs = receipt?.timings?.totalMs ?? state.elapsedMs;
+
+      let problem = null;
+      if (receipt?.status !== 'real') {
+        problem = {
+          code: 'receipt-status-nonreal',
+          message: `Terminal route receipt is ${receipt?.status ?? 'missing'}, not real.`,
+        };
+      } else if (!Number.isSafeInteger(receipt?.generationId) || receipt.generationId <= 0) {
+        problem = {
+          code: 'receipt-generation-missing',
+          message: 'Terminal route receipt has no positive generation identity.',
+          expectedGenerationId: generationId,
+          actualGenerationId: receipt?.generationId ?? null,
+        };
+      } else if (receipt.generationId !== generationId) {
+        problem = {
+          code: 'receipt-generation-mismatch',
+          message: `Terminal route receipt belongs to generation ${receipt.generationId}, not ${generationId}.`,
+          expectedGenerationId: generationId,
+          actualGenerationId: receipt.generationId,
+        };
+      } else {
+        problem = terminalSubmissionProblem(submission);
+      }
+
+      if (problem) {
+        state.status = 'invalid';
+        state.failure = {
+          name: 'TerminalEvidenceError',
+          phase: 'terminal-evidence-validation',
+          ...problem,
+        };
+        updateElapsed();
+        return;
+      }
+
+      state.status = 'succeeded';
+      state.timings = clone(receipt.timings?.stages ?? []);
+      state.elapsedMs = receipt.timings?.totalMs ?? state.elapsedMs;
     },
 
     fail(error) {
@@ -135,4 +213,3 @@ export function createFrontendTelemetry({
     },
   });
 }
-

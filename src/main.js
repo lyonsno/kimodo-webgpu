@@ -62,6 +62,9 @@ function renderTelemetry(snapshot) {
   const scheduler = snapshot.scheduler ?? {};
   const submission = snapshot.submission;
   const progress = snapshot.progress;
+  const evidenceProblem = snapshot.failure?.phase === 'terminal-evidence-validation'
+    ? `${snapshot.failure.code}: ${snapshot.failure.message}`
+    : null;
 
   routeStateEl.dataset.state = state;
   schedulerStateEl.dataset.state = state;
@@ -69,7 +72,8 @@ function renderTelemetry(snapshot) {
   gpuQueueStateEl.dataset.state = state;
   timingStateEl.dataset.state = state;
 
-  routeStateEl.textContent = `${route.effectiveRouteId ?? route.requestedRouteId ?? KIMODO_ROUTE_ID} · ${route.receiptStatus ?? state}`;
+  routeStateEl.textContent = `${route.effectiveRouteId ?? route.requestedRouteId ?? KIMODO_ROUTE_ID} · ${route.receiptStatus ?? state}`
+    + (evidenceProblem ? ` · INVALID ${evidenceProblem}` : '');
   schedulerStateEl.textContent = `${scheduler.mode ?? 'cooperative-foreground-boundary'} · ${state}`
     + (progress ? ` · step ${progress.step}/${progress.numSteps}` : '');
   foregroundStateEl.textContent = `${scheduler.observedForegroundBoundaryCount ?? 0}/${scheduler.expectedForegroundBoundaryCount ?? '?'} boundaries observed`
