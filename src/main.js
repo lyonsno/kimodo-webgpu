@@ -7,13 +7,9 @@
  */
 
 import { initGPU } from './lib/gpu.js';
-import { loadWeights } from './lib/weights.js';
-import { loadConfig, singleForwardPass, forwardTransformer, readBuffer } from './lib/inference.js';
-import { loadMotionRepStats, denoiseStepWebGPU } from './lib/denoiser.js';
-import { loadFKData, decodeMotion } from './lib/fk_decode.js';
-import { captureBackendIdentity, createStagedProfile, createKimodoRouteReceipt, setTextEmbeddingEndpoint, describeInvalidReceipt } from './lib/route-receipt.js';
+import { createKimodoProducer } from './lib/producer.js';
+import { describeInvalidReceipt } from './lib/route-receipt.js';
 import { classifyGenerationState, classifyMotionExport, createGenerationLifecycle } from './lib/generation-state.js';
-import { createWebGpuBoundedSubmissionQueue } from '@kaminos/webgpu-inference-kit';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
 // decide whether the generation it is watching has terminally settled. Keeping
@@ -42,8 +38,6 @@ let gpuDevice = null;
 let gpuAdapter = null;
 let gpuBackendIdentity = null;
 let modelConfig = null;
-let modelWeights = null;
-let motionRepStats = null;
 
 async function init() {
   try {
@@ -51,73 +45,34 @@ async function init() {
     const { adapter, device, backendIdentity } = await initGPU();
     gpuDevice = device;
     gpuAdapter = adapter;
-    // The kit-negotiated identity is the receipt's backend authority (the
-    // kit's evidence consumer validates it directly); Kimodo adapter/device
-    // details and the text-embedding externality ride as additive fields.
-    gpuBackendIdentity = captureBackendIdentity(adapter, device, backendIdentity);
     statusEl.textContent = 'WebGPU ready.';
     infoEl.textContent = `GPU: ${(device.limits.maxBufferSize / 1e9).toFixed(1)} GB max buffer`;
 
-    // Load config
-    statusEl.textContent = 'Loading model config...';
-    modelConfig = await loadConfig('/kimodo.json');
-    infoEl.textContent = `${modelConfig.model} | ${modelConfig.hidden_dim}d x ${modelConfig.num_layers}L | ${modelConfig.dtype}`;
-
-    // Load weights with progress
+    // The page hands its device to the producer as a BORROWED context — the
+    // same shape a Kaminos host uses when composing generation with its own
+    // live foreground. The producer loads config, FK data, motion stats, and
+    // the 540 MB weights (hashing the bytes actually consumed) and never
+    // destroys the device.
     statusEl.textContent = 'Loading weights (540 MB)...';
     const t0 = performance.now();
-
-    const resp = await fetch('/kimodo.bin');
-    const total = parseInt(resp.headers.get('Content-Length') || '0');
-    const reader = resp.body.getReader();
-    const chunks = [];
-    let loaded = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loaded += value.byteLength;
-      if (total > 0) {
-        const pct = Math.round(100 * loaded / total);
-        progressBar.style.width = `${pct}%`;
-        statusEl.textContent = `Loading weights... ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`;
-      }
-    }
-
-    // Combine into ArrayBuffer
-    const buffer = new ArrayBuffer(loaded);
-    const view = new Uint8Array(buffer);
-    let offset = 0;
-    for (const chunk of chunks) {
-      view.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    const downloadTime = ((performance.now() - t0) / 1000).toFixed(1);
-
-    // Identity of the weights actually consumed, from the bytes themselves.
-    // Computed once per load, in the background; the receipt awaits it. A
-    // receipt carrying a placeholder here cannot say WHICH model produced an
-    // output, so the hash comes from the loaded buffer, not from provenance.
-    weightsHashPromise = crypto.subtle.digest('SHA-256', buffer).then(
-      (h) => [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join(''),
-    );
-
-    statusEl.textContent = `Parsing weights and creating GPU buffers...`;
-
-    // Parse and upload to GPU
-    const t1 = performance.now();
-    modelWeights = await loadWeights(gpuDevice, buffer);
-    const uploadTime = ((performance.now() - t1) / 1000).toFixed(1);
-
-    // Load motion_rep stats for root conversion + FK data
-    motionRepStats = await loadMotionRepStats('/motion_rep_stats.json');
-    await loadFKData('/fk_data.json');
-
+    producer = await createKimodoProducer({
+      device,
+      adapter,
+      backendIdentity,
+      assetBase: '',
+      embedUrl: `${document.getElementById('server-url').value.trim()}/embed`,
+      onLoadProgress: ({ loaded, total }) => {
+        if (total > 0) {
+          progressBar.style.width = `${Math.round(100 * loaded / total)}%`;
+          statusEl.textContent = `Loading weights... ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`;
+        }
+      },
+    });
+    const loadTime = ((performance.now() - t0) / 1000).toFixed(1);
+    modelConfig = { fps: producer.identity.fps };
     progressBar.style.width = '100%';
-    statusEl.textContent = `Ready. Weights loaded in ${downloadTime}s (download) + ${uploadTime}s (GPU upload).`;
-    infoEl.textContent += ` | ${(loaded / 1e6).toFixed(0)} MB | ${downloadTime}s + ${uploadTime}s`;
+    statusEl.textContent = `Ready. Model loaded in ${loadTime}s (download + GPU upload).`;
+    infoEl.textContent = `${producer.identity.model.id} | kit ${producer.identity.kitVersion} | ${loadTime}s`;
     generateBtn.disabled = false;
 
   } catch (err) {
@@ -126,38 +81,32 @@ async function init() {
   }
 }
 
-let weightsHashPromise = null;
+let producer = null;
 
 // All generation evidence flows through the lifecycle owner: single-flight
 // admission plus ownership-checked publication. generate() is globally
 // callable (window.generate), so the overlap policy must live at this
 // boundary, not in DOM button state.
-// Honest projection of a bounded-submission report for receipt/failure
-// evidence: counts and terminal status, not the uncapped duty ledger.
-function summarizeSubmissionReport(report, error = null) {
-  if (!report) {
-    return error ? { status: 'unreported', error: String(error?.message ?? error) } : null;
-  }
-  return {
-    status: report.status,
-    maxInFlightDuties: report.maxInFlightDuties,
-    maxObservedInFlightDuties: report.maxObservedInFlightDuties,
-    submittedDutyCount: report.submittedDutyCount,
-    completedDutyCount: report.completedDutyCount,
-    failedDutyCount: report.failedDutyCount,
-    inFlightDutyCount: report.inFlightDutyCount,
-    ...(error ? { drainError: String(error?.message ?? error) } : {}),
-  };
-}
-
 const generationLifecycle = createGenerationLifecycle({
   setReceipt: (r) => { window.__kimodoLastReceipt = r; },
   setMotion: (m) => { window.__kimodoLastMotion = m; },
   getReceipt: () => window.__kimodoLastReceipt ?? null,
 });
 
+const EMBEDDING_HELP = {
+  'embedding-unreachable': (url) =>
+    'This route requires an external /embed endpoint returning a 4096-float ' +
+    'text embedding. It is not bundled with this repository — see the README ' +
+    `setup section. (endpoint: ${url})`,
+  'embedding-http': (url) =>
+    `POST ${url} must accept {"prompt": "..."} and return ` +
+    '{"embedding": [...4096 floats]}. See the README setup section for the contract.',
+  'embedding-unusable': () =>
+    'Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B text encoder and returns finite floats.',
+};
+
 async function generate() {
-  if (!modelWeights || !gpuDevice) return;
+  if (!producer || !gpuDevice) return;
 
   const prompt = document.getElementById('prompt').value.trim();
   if (!prompt) return;
@@ -174,315 +123,78 @@ async function generate() {
   }
   const { generationId } = run;
 
-  // Hoisted so the catch path can stop GPU admission for failures that occur
-  // after the bounded queue exists.
-  let gpuAbort = null;
-  let submissions = null;
-  let gpuSubmissionSummary = null;
-
   // The settlement guard covers EVERYTHING after successful admission: a
   // synchronous throw in input reads or UI setup outside the try would
-  // otherwise strand the single-flight owner permanently (in-progress
-  // receipt, occupied slot, every later generate() rejected).
+  // otherwise strand the single-flight owner permanently.
   try {
     const duration = parseFloat(document.getElementById('duration').value) || 6;
     const numSteps = parseInt(document.getElementById('steps').value) || 100;
-    const numFrames = Math.round(duration * modelConfig.fps);
-    const serverUrl = document.getElementById('server-url').value.trim();
+    const embedUrl = `${document.getElementById('server-url').value.trim()}/embed`;
 
     generateBtn.disabled = true;
     progressBar.style.width = '0%';
-
-    // Route receipt profiling
-    const profile = createStagedProfile();
-    profile.start('text-embedding');
-
-    // Step 1: Get text embedding from server.
-    // This is the one stage the browser cannot compute. It requires an external
-    // /embed endpoint (see README "Provide a text embedding endpoint"). Fail loud
-    // here rather than proceeding with a zero/garbage embedding, which would still
-    // produce plausible-looking motion and hide the missing prerequisite.
-    statusEl.textContent = 'Requesting text embedding from server...';
-
-    let embResp;
-    try {
-      embResp = await fetch(`${serverUrl}/embed`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      });
-    } catch (netErr) {
-      run.publishFailure('embedding-unreachable', netErr.message);
-      statusEl.textContent = `Cannot reach the text embedding server at ${serverUrl}.`;
-      infoEl.textContent =
-        'This route requires an external /embed endpoint returning a 4096-float ' +
-        'text embedding. It is not bundled with this repository — see the README ' +
-        `setup section. (${netErr.message})`;
-      return;
-    }
-
-    if (!embResp.ok) {
-      run.publishFailure('embedding-http', `${embResp.status} ${embResp.statusText}`);
-      statusEl.textContent = `Text embedding request failed: ${embResp.status} ${embResp.statusText}.`;
-      infoEl.textContent =
-        `POST ${serverUrl}/embed must accept {"prompt": "..."} and return ` +
-        '{"embedding": [...4096 floats]}. See the README setup section for the contract.';
-      return;
-    }
-
-    const embData = await embResp.json();
-    // Length alone is not enough: Float32Array silently coerces, so 4096
-    // strings become 4096 NaNs and nulls become zeros. Either would reach
-    // diffusion and produce plausible-looking but meaningless motion. Require
-    // every element to be a finite number.
-    const emb = embData.embedding;
-    let embError = null;
-    if (!Array.isArray(emb)) {
-      embError = `expected an array, got ${typeof emb}`;
-    } else if (emb.length !== modelConfig.text_dim) {
-      embError = `expected ${modelConfig.text_dim} floats, got ${emb.length}`;
-    } else {
-      const badIndex = emb.findIndex(v => typeof v !== 'number' || !Number.isFinite(v));
-      if (badIndex !== -1) {
-        embError = `element ${badIndex} is not a finite number (${JSON.stringify(emb[badIndex])})`;
-      }
-    }
-    if (embError) {
-      run.publishFailure('embedding-unusable', embError);
-      statusEl.textContent = 'Text embedding server returned an unusable embedding.';
-      infoEl.textContent =
-        `${embError}. Check that the endpoint uses the Kimodo LLM2Vec/Llama 3 8B ` +
-        'text encoder and returns finite floats.';
-      return;
-    }
-    const textEmbedding = new Float32Array(emb);
-    profile.end(); // text-embedding
-    profile.start('ddim-sampling');
-
-    // Bounded GPU submission: the kit's queue controller owns queue.submit
-    // and applies depth backpressure, replacing the old fence-per-encoder
-    // pattern (~29k host round-trips per 100-step generation) with paced
-    // admission. Depth 2 keeps one duty encoding while one executes.
-    gpuAbort = new AbortController();
-    submissions = createWebGpuBoundedSubmissionQueue({
-      queue: gpuDevice.queue,
-      maxInFlightDuties: 2,
-      signal: gpuAbort.signal,
-    });
-
-    // Client-side DDIM loop
-    statusEl.textContent = `Running ${numSteps}-step DDIM on WebGPU...`;
     const t0 = performance.now();
-    const motionDim = 369; // root(5) + body(364)
 
-    // Cosine beta schedule (matching Kimodo's diffusion.py)
-    function alphaBarFn(t) { return Math.cos((t + 0.008) / 1.008 * Math.PI / 2) ** 2; }
-    const numBase = 1000;
-    const betasBase = [];
-    for (let i = 0; i < numBase; i++) {
-      betasBase.push(Math.min(1 - alphaBarFn((i+1)/numBase) / alphaBarFn(i/numBase), 0.999));
-    }
-    const alphasCumprodBase = [];
-    let acc = 1;
-    for (const b of betasBase) { acc *= (1 - b); alphasCumprodBase.push(acc); }
-
-    // Subsample timesteps
-    const fracStride = (numBase - 1) / Math.max(1, numSteps - 1);
-    const useTimesteps = [];
-    for (let i = 0; i < numSteps; i++) {
-      useTimesteps.push(Math.min(Math.round(i * fracStride), numBase - 1));
-    }
-
-    // Compute diffusion vars matching Kimodo's calc_diffusion_vars exactly:
-    // 1. Get base alphas_cumprod at subsampled positions
-    // 2. Recompute betas from consecutive ratios
-    // 3. Recompute alphas_cumprod from those betas
-    const subsampledAlphasCumprod = useTimesteps.map(t => alphasCumprodBase[t]);
-    const lastAlphasCumprod = [1.0, ...subsampledAlphasCumprod.slice(0, -1)];
-    const betas = subsampledAlphasCumprod.map((ac, i) => 1.0 - ac / lastAlphasCumprod[i]);
-    const alphas = betas.map(b => 1.0 - b);
-    const alphasCumprod = [];
-    let cumprod = 1.0;
-    for (const a of alphas) { cumprod *= a; alphasCumprod.push(Math.max(cumprod, 1e-9)); }
-    const alphasCumprodPrev = [1.0, ...alphasCumprod.slice(0, -1)];
-    const sqrtRecipAlphasCumprod = alphasCumprod.map(a => 1 / Math.sqrt(a));
-    const sqrtRecipm1AlphasCumprod = alphasCumprod.map(a => Math.sqrt((1 - a) / a));
-
-    // Initialize with Gaussian noise [numFrames, 369]
-    const motion = new Array(numFrames);
-    for (let f = 0; f < numFrames; f++) {
-      motion[f] = new Array(motionDim);
-      for (let d = 0; d < motionDim; d++) {
-        const u1 = Math.random(), u2 = Math.random();
-        motion[f][d] = Math.sqrt(-2 * Math.log(u1 + 1e-10)) * Math.cos(2 * Math.PI * u2);
-      }
-    }
-
-    // DDIM loop (reverse: t = numSteps-1 down to 0)
-    for (let step = numSteps - 1; step >= 0; step--) {
-      const pct = Math.round(100 * (numSteps - step) / numSteps);
-      progressBar.style.width = `${pct}%`;
-      statusEl.textContent = `WebGPU DDIM step ${numSteps - step}/${numSteps} (${pct}%)`;
-
-      // Toggle: use WebGPU or server for denoising
-      // WebGPU denoising
-      const predClean = await denoiseStepWebGPU(
-        gpuDevice, modelWeights, Array.from(textEmbedding),
-        motion, useTimesteps[step], motionRepStats,
-        // Duty identity: unique per generation/step; denoiser appends
-        // cfg-role and submodel. The controller rejects duplicates.
-        { submissions, dutyPrefix: `g${generationId}-s${numSteps - step}` },
-      );
-      // The route's declared per-diffusion-step cooperative checkpoint: one
-      // frame yield per step guarantees paint cadence for progress UI while
-      // the bounded queue paces GPU admission within the step.
-      await new Promise(requestAnimationFrame);
-
-      if (false && step === numSteps - 1) {
-        // Compare raw root model forward pass (no CFG, no TwostageDenoiser)
-        // Construct root input: [motion(369), zeros(369)] = [N, 738]
-        const rootInput = motion.map(f => [...f, ...new Array(369).fill(0)]);
-
-        // Server: raw root model
-        const srvResp = await fetch(`${serverUrl}/forward_root`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ root_input: rootInput, text_emb: Array.from(textEmbedding), timestep: useTimesteps[step] }),
-        });
-        const srvData = await srvResp.json();
-
-        // WebGPU: raw root model forward pass
-        const { createStorageBuffer } = await import('./lib/gpu.js');
-        const { forwardTransformer, readBuffer } = await import('./lib/inference.js');
-        const rootInputFlat = new Float32Array(motion.length * 738);
-        for (let f = 0; f < motion.length; f++) {
-          for (let d = 0; d < 369; d++) rootInputFlat[f * 738 + d] = motion[f][d];
-        }
-        const rootInputBuf = createStorageBuffer(gpuDevice, rootInputFlat);
-        const textBufCompare = createStorageBuffer(gpuDevice, new Float32Array(textEmbedding));
-        const gpuOutBuf = await forwardTransformer(gpuDevice, modelWeights.root, rootInputBuf, textBufCompare, useTimesteps[step], motion.length, 738, 5);
-        const gpuOut = await readBuffer(gpuDevice, gpuOutBuf, motion.length * 5);
-        rootInputBuf.destroy(); textBufCompare.destroy(); gpuOutBuf.destroy();
-
-        if (!srvData.error) {
-          console.log('[raw-root] Server out[0]: ' + JSON.stringify(srvData.output[0]));
-          console.log('[raw-root] WebGPU out[0]: ' + JSON.stringify(Array.from(gpuOut.slice(0, 5))));
-          if (srvData.xseq) {
-            console.log('[raw-root] Server xseq shape: ' + JSON.stringify(srvData.xseq.shape));
-            console.log('[raw-root] Server xseq[0] (text): ' + JSON.stringify(srvData.xseq.token0));
-            console.log('[raw-root] Server xseq[1] (pad): ' + JSON.stringify(srvData.xseq.token1));
-            console.log('[raw-root] Server xseq[50] (ts): ' + JSON.stringify(srvData.xseq.token50));
-            console.log('[raw-root] Server xseq[51] (hd): ' + JSON.stringify(srvData.xseq.token51));
-            console.log('[raw-root] Server xseq[52] (m0): ' + JSON.stringify(srvData.xseq.token52));
-          }
-        } else {
-          console.log('[raw-root] Server error: ' + srvData.error);
-        }
-      }
-      // DDIM update: compute eps, then x_{t-1}
-      const sqrtRecip = sqrtRecipAlphasCumprod[step];
-      const sqrtRecipm1 = sqrtRecipm1AlphasCumprod[step];
-      const alphaBarPrev = alphasCumprodPrev[step];
-
-      for (let f = 0; f < numFrames; f++) {
-        for (let d = 0; d < motionDim; d++) {
-          const eps = (sqrtRecip * motion[f][d] - predClean[f][d]) / sqrtRecipm1;
-          motion[f][d] = predClean[f][d] * Math.sqrt(alphaBarPrev) + Math.sqrt(1 - alphaBarPrev) * eps;
-        }
-      }
-    }
-
-    // Terminal drain: waits for every admitted duty's queue-prefix fence,
-    // and its report carries the pacing evidence for the receipt.
-    const submissionReport = await submissions.drain();
-    gpuSubmissionSummary = summarizeSubmissionReport(submissionReport);
+    const result = await producer.generate({
+      prompt,
+      steps: numSteps,
+      duration,
+      generationId,
+      embedUrl,
+      onStage: (name, event) => {
+        if (event !== 'start') return;
+        statusEl.textContent = {
+          'text-embedding': 'Requesting text embedding from server...',
+          'ddim-sampling': `Running ${numSteps}-step DDIM on WebGPU...`,
+          'fk-decode': 'Decoding to joints...',
+          'output-capture': 'Capturing output...',
+        }[name] ?? name;
+      },
+      onProgress: async ({ step, pct }) => {
+        progressBar.style.width = `${pct}%`;
+        statusEl.textContent = `WebGPU DDIM step ${step}/${numSteps} (${pct}%)`;
+        // The route's declared per-diffusion-step cooperative checkpoint: one
+        // frame yield per step guarantees paint cadence for the progress UI.
+        await new Promise(requestAnimationFrame);
+      },
+    });
 
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
-    profile.end(); // ddim-sampling
-    profile.start('fk-decode');
-    statusEl.textContent = `Generated in ${genTime}s — decoding to joints...`;
-
-    // Decode motion features to joint positions — entirely client-side!
-    const t1 = performance.now();
-    const decoded = decodeMotion(motion);
-    const decodeTime = ((performance.now() - t1)).toFixed(0);
-    console.log(`[kimodo-webgpu] FK decode: ${decodeTime}ms for ${decoded.num_frames} frames`);
-
-    profile.end(); // fk-decode
-    profile.start('output-capture');
-
+    const { receipt, motion } = result;
     progressBar.style.width = '100%';
-    renderSkeletonFromJoints(decoded);
+    renderSkeletonFromJoints({
+      joints: motion.joints, parents: motion.parents,
+      num_frames: motion.numFrames, num_joints: motion.numJoints,
+    });
 
-    // Emit route receipt. Record the endpoint actually used rather than
-    // assuming a device the server never reported.
-    const receipt = await createKimodoRouteReceipt({
-      prompt,
-      joints: decoded.joints,
-      motionFeatures: motion,
-      numFrames: decoded.num_frames,
-      numJoints: decoded.num_joints,
-      numSteps,
-      backend: setTextEmbeddingEndpoint(gpuBackendIdentity, `${serverUrl}/embed`),
-      profile,
-      generationId,
-      gpuSubmission: gpuSubmissionSummary,
-      weightsHash: weightsHashPromise ? await weightsHashPromise : undefined,
-    });
-    profile.end(); // output-capture
-    // Publish the structured receipt plus the generation's motion data for
-    // tooling (retargeting, gait analysis, export) through the lifecycle
-    // owner, which refuses the write if this run no longer owns the slot.
-    // Same trust level as the receipt: page-local, read by local harnesses.
-    // motion rows are plain Array(369) — the representation the receipt
-    // validator certifies — and the last four values of each row are the
-    // foot-contact channels.
-    run.publishSuccess(receipt, {
-      generationId,
-      prompt,
-      fps: modelConfig.fps,
-      motion,                    // [N] x Array(369) raw features
-      joints: decoded.joints,    // [N][30][3] FK world positions
-      parents: decoded.parents,  // [30] skeleton hierarchy
-      numFrames: decoded.num_frames,
-      numJoints: decoded.num_joints,
-    });
+    // Publish receipt + motion through the lifecycle owner, which refuses the
+    // write if this run no longer owns the slot. Same trust level for both:
+    // page-local evidence read by local harnesses. motion rows are plain
+    // Array(369); the last four values of each row are the foot contacts.
+    run.publishSuccess(receipt, motion);
     console.log('[kimodo-webgpu] Route receipt:', JSON.stringify(receipt.profile));
     console.log('[kimodo-webgpu] Receipt status:', receipt.status, '| model:', receipt.model.id);
 
     if (receipt.status !== 'real') {
       statusEl.textContent = `Generation produced an invalid receipt — ${receipt.fallbackReason}`;
-      // Output-derived invalidity and kit/schema demotion are different
-      // failures with different remedies; describeInvalidReceipt names the
-      // actual one instead of blaming non-finite output for both.
       infoEl.textContent = describeInvalidReceipt(receipt);
       return;
     }
 
     // "client-side" is scoped deliberately: text embedding is server-side.
-    infoEl.textContent = `${decoded.num_frames}f @ 30fps | ${genTime}s diffusion + ${decodeTime}ms FK | ${numSteps} steps | diffusion+FK client-side, text embedding via server`;
-    statusEl.textContent = `Generated ${decoded.num_frames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${decoded.num_joints} joints)`;
+    const ddimMs = receipt.timings?.stages?.find((s) => s.name === 'ddim-sampling')?.durationMs;
+    infoEl.textContent = `${motion.numFrames}f @ ${motion.fps}fps | ${genTime}s total (${ddimMs ?? '?'}ms diffusion) | ${numSteps} steps | diffusion+FK client-side, text embedding via server`;
+    statusEl.textContent = `Generated ${motion.numFrames} frames in ${genTime}s (WebGPU diffusion + JS FK → ${motion.numJoints} joints)`;
 
   } catch (err) {
-    // Stop admitting GPU work, then WAIT for the controller to reach a
-    // terminal state before ownership is released in finally: aborting alone
-    // leaves accepted duties tracked in flight, and the next generation must
-    // not begin while this one's work is unsettled. The original error stays
-    // authoritative; the terminal (or failed-drain) report rides the failure
-    // evidence so cancellation, submission failure, completion failure, and
-    // caller-side exceptions stay distinguishable.
-    if (gpuAbort) gpuAbort.abort();
-    if (submissions) {
-      try {
-        const report = await submissions.drain();
-        gpuSubmissionSummary = summarizeSubmissionReport(report);
-      } catch (drainErr) {
-        gpuSubmissionSummary = summarizeSubmissionReport(
-          drainErr?.boundedGpuSubmissionReport ?? null, drainErr);
-      }
-    }
-    run.publishFailure('exception', err.message, { gpuSubmission: gpuSubmissionSummary });
+    // Producer errors carry their phase and, after the queue exists, the
+    // terminal bounded-submission report; the original error stays
+    // authoritative and the report rides the failure evidence.
+    const phase = err?.phase ?? 'exception';
+    run.publishFailure(phase, err.message, err?.gpuSubmission ? { gpuSubmission: err.gpuSubmission } : null);
     statusEl.textContent = `Error: ${err.message}`;
+    const help = EMBEDDING_HELP[phase];
+    if (help) infoEl.textContent = help(`${document.getElementById('server-url').value.trim()}/embed`);
     console.error(err);
   } finally {
     // Structural backstop: settle() converts a still-in-progress receipt to a

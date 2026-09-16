@@ -120,8 +120,12 @@ check('main.js wires the window evidence globals into the lifecycle owner',
     && /setMotion:\s*\(m\)\s*=>\s*\{\s*window\.__kimodoLastMotion\s*=\s*m/.test(mainSrc));
 
 check('main.js publishes success evidence only through the owner handle',
-  /run\.publishSuccess\(receipt,\s*\{\s*\n?\s*generationId/.test(mainSrc)
+  /run\.publishSuccess\(receipt,\s*motion\)/.test(mainSrc)
     && !/window\.__kimodoLastMotion\s*=\s*\{/.test(mainSrc));
+
+check('main.js binds the producer generation to the lifecycle generation id',
+  /producer\.generate\(\{[\s\S]*?generationId,/.test(mainSrc),
+  'producer.generate must receive the owner-issued generationId');
 
 check('main.js exposes the motion classifier choke point',
   /__kimodoMotionState\s*=/.test(mainSrc) && mainSrc.includes('classifyMotionExport'));

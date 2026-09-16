@@ -366,11 +366,12 @@ async function measureForward(frames, { failSubmit = false } = {}) {
   // other hoisted queue handles, BEFORE the settlement try — the catch path
   // assigns it.
   const { readFileSync } = await import('node:fs');
-  const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-  const genBody = mainSrc.slice(mainSrc.indexOf('async function generate()'));
+  // The DDIM loop and its failure path now live in the producer.
+  const producerSrc = readFileSync(new URL('../src/lib/producer.js', import.meta.url), 'utf8');
+  const genBody = producerSrc.slice(producerSrc.indexOf('async function generate('));
   const declIdx = genBody.indexOf('let gpuSubmissionSummary');
   const tryIdx = genBody.indexOf('try {');
-  check('gpuSubmissionSummary is hoisted beside the queue handles, before the try',
+  check('gpuSubmissionSummary is declared before the producer generate() try',
     declIdx !== -1 && tryIdx !== -1 && declIdx < tryIdx,
     JSON.stringify({ declIdx, tryIdx }));
 }

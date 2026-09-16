@@ -256,9 +256,11 @@ function fakeGpuEnvironment({ withTimestamp }) {
 // --- Wiring (source presence, routing only) --------------------------------
 
 const mainSrc = readFileSync(new URL('../src/main.js', import.meta.url), 'utf8');
-check('main.js uses the kit identity as the receipt backend authority',
-  /gpuBackendIdentity\s*=\s*captureBackendIdentity\(adapter,\s*device,\s*backendIdentity\)/.test(mainSrc),
-  'expected captureBackendIdentity(adapter, device, backendIdentity) with the kit identity as base');
+const producerSrc = readFileSync(new URL('../src/lib/producer.js', import.meta.url), 'utf8');
+check('main.js hands the kit identity to the producer, which makes it the receipt backend authority',
+  /createKimodoProducer\(\{[\s\S]*?backendIdentity,/.test(mainSrc)
+    && /captureBackendIdentity\(input\.adapter \?\? null, device, input\.backendIdentity/.test(producerSrc),
+  'expected backendIdentity passed into createKimodoProducer and used as the identity base');
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const pin = pkg.devDependencies?.['@kaminos/webgpu-inference-kit'] ?? pkg.dependencies?.['@kaminos/webgpu-inference-kit'];

@@ -9,6 +9,11 @@
 
 let fkData = null;
 
+/** Inject already-loaded FK data (host-provided or test fixture). */
+export function setFKData(data) {
+  fkData = data;
+}
+
 export async function loadFKData(url = '/fk_data.json') {
   fkData = await (await fetch(url)).json();
   console.log(`[fk] Loaded: ${fkData.num_joints} joints, ${fkData.joint_names.length} names`);

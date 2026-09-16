@@ -90,6 +90,9 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
     let rootOutBuf = null;
     try {
       rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, dutyFor('root'));
+      // Foreground boundary: the pass's duty is admitted; a host may place
+      // its own work (e.g. a live frame) on the shared queue here.
+      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-root` });
       rootPred = await readBuffer(device, rootOutBuf, N * 5);
     } finally {
       rootInputBuf.destroy();
@@ -120,6 +123,7 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
     let bodyOutBuf = null;
     try {
       bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, dutyFor('body'));
+      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-body` });
       bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
     } finally {
       bodyInputBuf.destroy();
