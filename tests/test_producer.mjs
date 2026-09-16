@@ -378,12 +378,17 @@ function synthesizeWeightsBin() {
   return buf;
 }
 
-function assetFetch(calls, { failOn = null } = {}) {
+function assetFetch(calls, { failOn = null, rejectOn = null, readerRejects = false } = {}) {
   const bin = synthesizeWeightsBin();
   const jsonResp = (obj) => ({ ok: true, status: 200, json: async () => obj });
   return async (url, init) => {
     calls.push(url);
+    if (rejectOn && url.endsWith(rejectOn)) throw new TypeError('fetch failed');
     if (failOn && url.endsWith(failOn)) return { ok: false, status: 500, statusText: 'boom', json: async () => ({}) };
+    if (readerRejects && url.endsWith('/kimodo.bin')) {
+      return { ok: true, status: 200, headers: { get: () => String(bin.byteLength) },
+        body: { getReader: () => ({ read: async () => { throw new Error('stream reset mid-body'); } }) } };
+    }
     if (url.endsWith('/kimodo.json')) return jsonResp(config);
     if (url.endsWith('/fk_data.json')) return jsonResp(fkData);
     if (url.endsWith('/motion_rep_stats.json')) return jsonResp(motionRepStats);
@@ -444,6 +449,74 @@ function assetFetch(calls, { failOn = null } = {}) {
   } catch (err) { error = err; }
   check('a failing asset response is phase-named, not a raw error',
     error?.phase === 'load-stats', JSON.stringify({ phase: error?.phase, m: error?.message }));
+}
+
+// --- r2 review: cancellation lifetime, race-listener cleanup, ------------
+// --- post-allocation rollback, complete asset-phase attribution ----------
+
+for (const [stageName, label] of [['fk-decode', 'FK decode'], ['output-capture', 'output capture']]) {
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const abort = new AbortController();
+  let outcome = null; let error = null;
+  try {
+    const result = await producer.generate({
+      prompt: 'x', steps: 1, duration: 0.1, signal: abort.signal,
+      onStage: (name, event) => { if (name === stageName && event === 'start') abort.abort(); },
+    });
+    outcome = result?.receipt?.status ?? 'returned';
+  } catch (err) { error = err; }
+  check(`an abort at ${label} start settles the generation as cancelled, never as a real receipt`,
+    outcome === null && error?.phase === 'cancelled', JSON.stringify({ outcome, phase: error?.phase }));
+}
+
+{
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const spy = makeSignalSpy();
+  const pending = producer.generate({ prompt: 'x', steps: 2, duration: 0.1, signal: spy,
+    foregroundOpportunity: () => new Promise(() => {}) });
+  setTimeout(() => spy.abort(), 50);
+  let error = null;
+  try { await Promise.race([pending, new Promise((_, r) => setTimeout(() => r(new Error('did not settle')), 3000))]); } catch (err) { error = err; }
+  check('an abort with a foreign signal and a never-settling hook leaves zero listeners after rejection',
+    error?.phase === 'cancelled' && spy.listenerCount === 0, JSON.stringify({ phase: error?.phase, listeners: spy.listenerCount }));
+}
+
+for (const failAt of [1, 50]) {
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const device = makeFakeDevice(counters);
+  let allocated = 0;
+  const origCreate = device.createBuffer;
+  device.createBuffer = (desc) => {
+    const buf = origCreate(desc);
+    allocated++;
+    if (allocated === failAt) buf.getMappedRange = () => { throw new Error('injected mapped initialization failure'); };
+    return buf;
+  };
+  let error = null;
+  try {
+    await createKimodoProducer({ device, embedUrl: 'http://assets.test/embed', fetch: assetFetch([]), assetBase: 'http://assets.test', backendIdentity });
+  } catch (err) { error = err; }
+  check(`a mapped-initialization failure on buffer ${failAt} destroys every allocated buffer, including the failing one`,
+    error?.phase === 'load-weights' && counters.destroyed === allocated && allocated === failAt,
+    JSON.stringify({ phase: error?.phase, allocated, destroyed: counters.destroyed }));
+}
+
+for (const [mode, expectPhase, label] of [
+  [{ rejectOn: '/kimodo.json' }, 'load-config', 'a rejected config request'],
+  [{ rejectOn: '/kimodo.bin' }, 'load-weights', 'a rejected weights request'],
+  [{ readerRejects: true }, 'load-weights', 'a weight body stream that fails mid-read'],
+]) {
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  let error = null;
+  try {
+    await createKimodoProducer({ device: makeFakeDevice(counters), embedUrl: 'http://assets.test/embed',
+      fetch: assetFetch([], mode), assetBase: 'http://assets.test', backendIdentity });
+  } catch (err) { error = err; }
+  check(`${label} is phase-named ${expectPhase} with the original error as cause`,
+    error?.phase === expectPhase && error?.cause instanceof Error,
+    JSON.stringify({ phase: error?.phase ?? null, name: error?.name, m: error?.message, cause: error?.cause?.message ?? null }));
 }
 
 process.exit(failures ? 1 : 0);

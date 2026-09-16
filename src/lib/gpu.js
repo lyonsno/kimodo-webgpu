@@ -55,8 +55,13 @@ export function createStorageBuffer(device, data, usage = 0) {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | usage,
     mappedAtCreation: true,
   });
-  new (data.constructor)(buffer.getMappedRange()).set(data);
-  buffer.unmap();
+  try {
+    new (data.constructor)(buffer.getMappedRange()).set(data);
+    buffer.unmap();
+  } catch (err) {
+    buffer.destroy(); // allocated but never handed out: nobody else can reclaim it
+    throw err;
+  }
   return buffer;
 }
 

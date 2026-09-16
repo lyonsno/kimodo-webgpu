@@ -148,35 +148,49 @@ export async function createKimodoProducer(input = {}) {
     }
     setFKData(fkData);
   } else {
-    const cfgResp = await fetchImpl(`${assetBase}/kimodo.json`);
-    if (!cfgResp?.ok) throw new KimodoProducerError('load-config', `could not load ${assetBase}/kimodo.json`);
-    config = await cfgResp.json();
-    try { await loadFKData(`${assetBase}/fk_data.json`, fetchImpl); }
-    catch (err) { throw new KimodoProducerError('load-fk', err.message); }
-    try { motionRepStats = await loadMotionRepStats(`${assetBase}/motion_rep_stats.json`, fetchImpl); }
-    catch (err) { throw new KimodoProducerError('load-stats', err.message); }
-
-    const resp = await fetchImpl(`${assetBase}/kimodo.bin`);
-    if (!resp?.ok) throw new KimodoProducerError('load-weights', `could not load ${assetBase}/kimodo.bin`);
-    const total = parseInt(resp.headers?.get?.('Content-Length') || '0', 10);
-    const reader = resp.body.getReader();
-    const chunks = [];
-    let loaded = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loaded += value.byteLength;
-      input.onLoadProgress?.({ loaded, total });
-    }
-    const buffer = new ArrayBuffer(loaded);
-    const view = new Uint8Array(buffer);
-    let offset = 0;
-    for (const chunk of chunks) { view.set(chunk, offset); offset += chunk.byteLength; }
-    // Identity of the weights actually consumed, from the bytes themselves.
-    weightsHash = await sha256Hex(buffer);
-    try { weights = await loadWeights(device, buffer); }
-    catch (err) { throw new KimodoProducerError('load-weights', err.message); } // loadWeights rolled back its own buffers
+    // Each asset is acquired as one phase-named operation — request,
+    // response decoding, body streaming, hashing and GPU upload included —
+    // so the host always sees a KimodoProducerError with the phase and the
+    // original error as cause, never a bare fetch/stream failure.
+    const phased = async (phase, work) => {
+      try { return await work(); }
+      catch (err) {
+        if (err instanceof KimodoProducerError) throw err;
+        const wrapped = new KimodoProducerError(phase, err?.message ?? String(err));
+        wrapped.cause = err;
+        throw wrapped;
+      }
+    };
+    config = await phased('load-config', async () => {
+      const cfgResp = await fetchImpl(`${assetBase}/kimodo.json`);
+      if (!cfgResp?.ok) throw new Error(`could not load ${assetBase}/kimodo.json: ${cfgResp?.status ?? 'no response'}`);
+      return cfgResp.json();
+    });
+    await phased('load-fk', () => loadFKData(`${assetBase}/fk_data.json`, fetchImpl));
+    motionRepStats = await phased('load-stats', () => loadMotionRepStats(`${assetBase}/motion_rep_stats.json`, fetchImpl));
+    ({ weights, weightsHash } = await phased('load-weights', async () => {
+      const resp = await fetchImpl(`${assetBase}/kimodo.bin`);
+      if (!resp?.ok) throw new Error(`could not load ${assetBase}/kimodo.bin: ${resp?.status ?? 'no response'}`);
+      const total = parseInt(resp.headers?.get?.('Content-Length') || '0', 10);
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let loaded = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.byteLength;
+        input.onLoadProgress?.({ loaded, total });
+      }
+      const buffer = new ArrayBuffer(loaded);
+      const view = new Uint8Array(buffer);
+      let offset = 0;
+      for (const chunk of chunks) { view.set(chunk, offset); offset += chunk.byteLength; }
+      // Identity of the weights actually consumed, from the bytes themselves.
+      const hash = await sha256Hex(buffer);
+      const uploaded = await loadWeights(device, buffer); // rolls back its own buffers on failure
+      return { weights: uploaded, weightsHash: hash };
+    }));
     ownsWeights = true;
   }
 
@@ -252,13 +266,19 @@ export async function createKimodoProducer(input = {}) {
     const raceAbort = (promise) => {
       if (!signal) return promise;
       return new Promise((resolve, reject) => {
-        const onAbortRace = () => reject(cancelledError());
+        // Whichever side settles first detaches the abort listener itself;
+        // the loser is a no-op. A foreign signal need not honor { once }.
+        let settled = false;
+        const settle = (fn, value) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbortRace);
+          fn(value);
+        };
+        function onAbortRace() { settle(reject, cancelledError()); }
         if (signal.aborted) return onAbortRace();
-        signal.addEventListener('abort', onAbortRace, { once: true });
-        Promise.resolve(promise).then(
-          (v) => { signal.removeEventListener('abort', onAbortRace); resolve(v); },
-          (e) => { signal.removeEventListener('abort', onAbortRace); reject(e); },
-        );
+        signal.addEventListener('abort', onAbortRace);
+        Promise.resolve(promise).then((v) => settle(resolve, v), (e) => settle(reject, e));
       });
     };
 
@@ -278,122 +298,132 @@ export async function createKimodoProducer(input = {}) {
     let gpuSubmissionSummary = null;
     let motion;
     let submissions = null;
-    try {
-      stage('text-embedding', 'start');
-      profile.start('text-embedding');
-      const textEmbedding = await fetchEmbedding(prompt, embedUrl, signal);
+    try { // whole-operation scope: the abort bridge lives until this returns or throws
+      try {
+        stage('text-embedding', 'start');
+        profile.start('text-embedding');
+        const textEmbedding = await fetchEmbedding(prompt, embedUrl, signal);
+        profile.end();
+        stage('text-embedding', 'end');
+        checkCancelled();
+
+        stage('ddim-sampling', 'start');
+        profile.start('ddim-sampling');
+        submissions = createWebGpuBoundedSubmissionQueue({
+          queue,
+          maxInFlightDuties: opts.maxInFlightDuties ?? 2,
+          signal: gpuAbort.signal,
+        });
+        boundaryOpen = true;
+        const sched = ddimSchedule(numSteps);
+        motion = gaussianNoise(numFrames);
+        const textArr = Array.from(textEmbedding);
+        for (let step = numSteps - 1; step >= 0; step--) {
+          checkCancelled();
+          const n = numSteps - step;
+          const predClean = await denoiseStepWebGPU(
+            device, weights, textArr, motion, sched.useTimesteps[step], motionRepStats,
+            {
+              submissions,
+              dutyPrefix: `g${generationId}-s${n}`,
+              // Foreground-opportunity boundary between admitted duties: the
+              // host may submit its own work on the shared queue here.
+              afterPass: opts.foregroundOpportunity
+                ? ({ pass }) => raceAbort(opts.foregroundOpportunity({
+                  submit: hostSubmit, signal: gpuAbort.signal,
+                  phase: 'ddim-sampling', step: n, numSteps, pass,
+                }))
+                : undefined,
+            },
+          );
+          const sqrtRecip = sched.sqrtRecipAlphasCumprod[step];
+          const sqrtRecipm1 = sched.sqrtRecipm1AlphasCumprod[step];
+          const alphaBarPrev = sched.alphasCumprodPrev[step];
+          for (let f = 0; f < numFrames; f++) {
+            for (let d = 0; d < MOTION_DIM; d++) {
+              const eps = (sqrtRecip * motion[f][d] - predClean[f][d]) / sqrtRecipm1;
+              motion[f][d] = predClean[f][d] * Math.sqrt(alphaBarPrev) + Math.sqrt(1 - alphaBarPrev) * eps;
+            }
+          }
+          if (opts.onProgress) await raceAbort(opts.onProgress({ step: n, numSteps, pct: Math.round(100 * n / numSteps) }));
+        }
+        boundaryOpen = false;
+        const report = await submissions.drain();
+        gpuSubmissionSummary = { ...summarizeSubmissionReport(report), hostSubmissionCount: hostFences.length };
+      } catch (err) {
+        // Stop admission, revoke the host's submit, settle accepted producer
+        // duties AND the host's accepted work before surfacing; the original
+        // error stays authoritative, the reports are evidence.
+        boundaryOpen = false;
+        gpuAbort.abort();
+        if (submissions) {
+          try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
+          catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
+        }
+        await Promise.allSettled(hostFences);
+        if (gpuSubmissionSummary) gpuSubmissionSummary.hostSubmissionCount = hostFences.length;
+        if (err instanceof KimodoProducerError) { err.gpuSubmission = gpuSubmissionSummary; throw err; }
+        const wrapped = new KimodoProducerError(err?.name === 'AbortError' ? 'cancelled' : 'ddim-sampling', err?.message ?? String(err));
+        wrapped.cause = err;
+        wrapped.gpuSubmission = gpuSubmissionSummary;
+        throw wrapped;
+      }
       profile.end();
-      stage('text-embedding', 'end');
+      stage('ddim-sampling', 'end');
       checkCancelled();
 
-      stage('ddim-sampling', 'start');
-      profile.start('ddim-sampling');
-      submissions = createWebGpuBoundedSubmissionQueue({
-        queue,
-        maxInFlightDuties: opts.maxInFlightDuties ?? 2,
-        signal: gpuAbort.signal,
-      });
-      boundaryOpen = true;
-      const sched = ddimSchedule(numSteps);
-      motion = gaussianNoise(numFrames);
-      const textArr = Array.from(textEmbedding);
-      for (let step = numSteps - 1; step >= 0; step--) {
-        checkCancelled();
-        const n = numSteps - step;
-        const predClean = await denoiseStepWebGPU(
-          device, weights, textArr, motion, sched.useTimesteps[step], motionRepStats,
-          {
-            submissions,
-            dutyPrefix: `g${generationId}-s${n}`,
-            // Foreground-opportunity boundary between admitted duties: the
-            // host may submit its own work on the shared queue here.
-            afterPass: opts.foregroundOpportunity
-              ? ({ pass }) => raceAbort(opts.foregroundOpportunity({
-                submit: hostSubmit, signal: gpuAbort.signal,
-                phase: 'ddim-sampling', step: n, numSteps, pass,
-              }))
-              : undefined,
-          },
-        );
-        const sqrtRecip = sched.sqrtRecipAlphasCumprod[step];
-        const sqrtRecipm1 = sched.sqrtRecipm1AlphasCumprod[step];
-        const alphaBarPrev = sched.alphasCumprodPrev[step];
-        for (let f = 0; f < numFrames; f++) {
-          for (let d = 0; d < MOTION_DIM; d++) {
-            const eps = (sqrtRecip * motion[f][d] - predClean[f][d]) / sqrtRecipm1;
-            motion[f][d] = predClean[f][d] * Math.sqrt(alphaBarPrev) + Math.sqrt(1 - alphaBarPrev) * eps;
-          }
-        }
-        if (opts.onProgress) await raceAbort(opts.onProgress({ step: n, numSteps, pct: Math.round(100 * n / numSteps) }));
-      }
-      boundaryOpen = false;
-      const report = await submissions.drain();
-      gpuSubmissionSummary = { ...summarizeSubmissionReport(report), hostSubmissionCount: hostFences.length };
+      stage('fk-decode', 'start');
+      checkCancelled();
+      profile.start('fk-decode');
+      const decoded = decodeMotion(motion);
+      profile.end();
+      stage('fk-decode', 'end');
+      checkCancelled();
+
+      stage('output-capture', 'start');
+      checkCancelled();
+      profile.start('output-capture');
+      // Kit-negotiated identity (host-provided) is the receipt's backend
+      // authority; Kimodo adapter/device details ride as additive fields.
+      const backend = captureBackendIdentity(input.adapter ?? null, device, input.backendIdentity ?? null);
+      setTextEmbeddingEndpoint(backend, embedUrl);
+      const receipt = await raceAbort(createKimodoRouteReceipt({
+        prompt,
+        joints: decoded.joints,
+        motionFeatures: motion,
+        numFrames: decoded.num_frames,
+        numJoints: decoded.num_joints,
+        numSteps,
+        backend,
+        profile,
+        generationId,
+        weightsHash,
+        gpuSubmission: gpuSubmissionSummary,
+      }));
+      profile.end();
+      stage('output-capture', 'end');
+      checkCancelled();
+
+      return {
+        receipt,
+        motion: {
+          generationId,
+          prompt,
+          fps: config.fps,
+          motion,                   // [N] x Array(369) raw features; last 4 = foot contacts
+          joints: decoded.joints,   // [N][30][3] FK world positions
+          parents: decoded.parents,
+          numFrames: decoded.num_frames,
+          numJoints: decoded.num_joints,
+        },
+        submission: gpuSubmissionSummary,
+      };
     } catch (err) {
-      // Stop admission, revoke the host's submit, settle accepted producer
-      // duties AND the host's accepted work before surfacing; the original
-      // error stays authoritative, the reports are evidence.
-      boundaryOpen = false;
-      gpuAbort.abort();
-      if (submissions) {
-        try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
-        catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
-      }
-      await Promise.allSettled(hostFences);
-      if (gpuSubmissionSummary) gpuSubmissionSummary.hostSubmissionCount = hostFences.length;
-      if (err instanceof KimodoProducerError) { err.gpuSubmission = gpuSubmissionSummary; throw err; }
-      const wrapped = new KimodoProducerError(err?.name === 'AbortError' ? 'cancelled' : 'ddim-sampling', err?.message ?? String(err));
-      wrapped.cause = err;
-      wrapped.gpuSubmission = gpuSubmissionSummary;
-      throw wrapped;
+      if (err instanceof KimodoProducerError && err.gpuSubmission === undefined) err.gpuSubmission = gpuSubmissionSummary;
+      throw err;
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
     }
-    profile.end();
-    stage('ddim-sampling', 'end');
-
-    stage('fk-decode', 'start');
-    profile.start('fk-decode');
-    const decoded = decodeMotion(motion);
-    profile.end();
-    stage('fk-decode', 'end');
-
-    stage('output-capture', 'start');
-    profile.start('output-capture');
-    // Kit-negotiated identity (host-provided) is the receipt's backend
-    // authority; Kimodo adapter/device details ride as additive fields.
-    const backend = captureBackendIdentity(input.adapter ?? null, device, input.backendIdentity ?? null);
-    setTextEmbeddingEndpoint(backend, embedUrl);
-    const receipt = await createKimodoRouteReceipt({
-      prompt,
-      joints: decoded.joints,
-      motionFeatures: motion,
-      numFrames: decoded.num_frames,
-      numJoints: decoded.num_joints,
-      numSteps,
-      backend,
-      profile,
-      generationId,
-      weightsHash,
-      gpuSubmission: gpuSubmissionSummary,
-    });
-    profile.end();
-    stage('output-capture', 'end');
-
-    return {
-      receipt,
-      motion: {
-        generationId,
-        prompt,
-        fps: config.fps,
-        motion,                   // [N] x Array(369) raw features; last 4 = foot contacts
-        joints: decoded.joints,   // [N][30][3] FK world positions
-        parents: decoded.parents,
-        numFrames: decoded.num_frames,
-        numJoints: decoded.num_joints,
-      },
-      submission: gpuSubmissionSummary,
-    };
   }
 
   function dispose() {
