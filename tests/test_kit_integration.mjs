@@ -262,6 +262,6 @@ check('main.js uses the kit identity as the receipt backend authority',
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const pin = pkg.devDependencies?.['@kaminos/webgpu-inference-kit'] ?? pkg.dependencies?.['@kaminos/webgpu-inference-kit'];
-check('kit pin is current (^0.1.46)', pin === '^0.1.46', String(pin));
+check('kit pin is current (^0.1.49)', pin === '^0.1.49', String(pin));
 
 process.exit(failures ? 1 : 0);
