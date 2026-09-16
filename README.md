@@ -33,16 +33,16 @@ Max absolute error: **0.000645** across all output dimensions through 16 transfo
 
 ## Performance
 
-On M4 Max (Chrome, WebGPU via Metal):
+On M4 Max (Chrome, WebGPU via Metal), 100 DDIM steps, measured 2026-09-15 with a headless witness driving this page:
 
-| Stage | Time |
-|-------|------|
-| Text embedding (server, Llama 3 8B) | ~300ms |
-| DDIM sampling (50 steps, WebGPU) | ~25s |
-| FK decode (JS, CPU) | ~2ms |
-| **Total** | **~25s for 6 seconds of motion** |
+| Clip | DDIM sampling | Note |
+|------|---------------|------|
+| 6 s (180 frames) | ~33 s | ~61 s before bounded submission landed (1.85× faster) |
+| 18 s (540 frames, the UI maximum) | ~152 s | sequence length 592 tokens; attention cost grows quadratically with clip length |
 
-For comparison, the same model on PyTorch MPS takes ~12s. The WebGPU path is ~2x slower due to per-step GPU-CPU synchronization overhead, but the diffusion runs in the browser rather than on a server.
+Text embedding is ~0.3–0.8 s on the server; FK decode is 2–20 ms of JS. Sampling time scales linearly with the step count, so the UI default of 50 steps is about half the figures above.
+
+The diffusion loop keeps at most two transformer passes in flight on the GPU queue — one command buffer per pass, about eight fences per step instead of one per kernel — and reuses one fixed scratch set across layers, so the per-step host/GPU round trips that dominated earlier builds are gone. For reference, the same model on PyTorch MPS takes ~12 s for a 6-second clip at 50 steps.
 
 ## Architecture
 
@@ -51,9 +51,10 @@ Browser (this repo)                        Server (you supply)
 ┌─────────────────────────────────┐       ┌──────────────────┐
 │  540 MB fp16 weights (cached)   │       │ Llama 3 8B       │
 │  ↓                              │  ←──  │ text encoder     │
-│  DDIM loop (50 steps):          │ 4096  │ POST /embed      │
-│    Root model (16-layer xfmr)   │ floats│ (one call/gen)   │
-│    globalRootToLocalRoot (JS)   │       └──────────────────┘
+│  DDIM loop (50 steps, ≤2 GPU   │ 4096  │ POST /embed      │
+│    passes in flight):           │ floats│ (one call/gen)   │
+│    Root model (16-layer xfmr)   │       └──────────────────┘
+│    globalRootToLocalRoot (JS)   │
 │    Body model (16-layer xfmr)   │
 │    CFG guidance (JS)            │
 │    DDIM update (JS)             │
@@ -63,6 +64,8 @@ Browser (this repo)                        Server (you supply)
 │  Skeleton renderer (Canvas 2D)  │
 └─────────────────────────────────┘
 ```
+
+Runtime plumbing comes from [`@kaminos/webgpu-inference-kit`](https://www.npmjs.com/package/@kaminos/webgpu-inference-kit) (pinned `^0.1.49`): the bounded submission queue that paces the diffusion loop, backend-identity capture and validation, and the Kimodo route definition/receipt factories that stamp every generation with a validated receipt. The kernels themselves stay local.
 
 **WGSL compute shaders** (kernel layer shared with [moge-webgpu](https://github.com/lyonsno/moge-webgpu)):
 
@@ -184,6 +187,52 @@ Open the URL, type a prompt, click Generate. Weights download on first load (~54
 
 </details>
 
+## Using the route from another page
+
+The generation loop is also exposed as a host-callable producer, so another
+WebGPU page (Kaminos is the first consumer) can run Kimodo on **its own**
+device and queue and interleave its own rendering between the producer's GPU
+passes:
+
+```js
+import { createKimodoProducer, KimodoProducerError } from './src/lib/producer.js';
+
+const producer = await createKimodoProducer({
+  device,                              // the host's GPUDevice — never destroyed by the producer
+  embedUrl: 'http://localhost:8098/embed',
+  assetBase: '/kimodo-assets',         // serves kimodo.json, kimodo.bin, fk_data.json, motion_rep_stats.json
+  backendIdentity,                     // optional: the host's negotiated kit identity becomes the receipt's backend
+});
+
+const { receipt, motion } = await producer.generate({
+  prompt: 'a person walks forward', steps: 50, duration: 6,
+  signal,                              // AbortSignal — governs the whole call
+  onProgress: ({ step, numSteps }) => {},
+  foregroundOpportunity: async ({ submit, phase, step, pass }) => {
+    submit([hostCommandBuffer]);       // runs after the admitted producer pass, before its readback
+  },
+});
+producer.dispose();                    // destroys producer-owned weights only
+```
+
+`foregroundOpportunity` fires after every admitted transformer pass (four per
+DDIM step). Its `submit` is fenced — a failure never rejects before the host's
+accepted work has completed — and is revoked once the generation settles.
+Every error is a `KimodoProducerError` with a `phase` (`load-weights`,
+`embedding-http`, `cancelled`, `ddim-sampling`, …) and, after sampling
+started, the drained submission report. Weights the producer loads are its
+own to destroy; weights you pass in through `assets` stay yours unless you set
+`transferWeightsOwnership: true`. `motion` is the native result: `motion`
+rows `[frames][369]`, `joints` `[frames][30][3]`, `parents`, `fps`, and
+counts.
+
+**Motion export for tools.** The page publishes the last generation through
+`window.__kimodoLastMotion` / `window.__kimodoLastReceipt` and a single
+choke point, `window.__kimodoMotionState(generationId)`, which answers
+`{usable: true}` only when the motion belongs to the generation you asked
+about and its receipt is terminal-`real`. Headless tools pull `motion.json`
+that way rather than scraping the canvas.
+
 ## Verification
 
 | Check | Status | Tool |
@@ -193,8 +242,10 @@ Open the URL, type a prompt, click Generate. Weights download on first load (~54
 | Full implementation review | ✅ 21 questions, no material findings | Independent fresh-context review |
 | FK decode review | ✅ 1 finding fixed | Independent fresh-context review |
 | Visual output coherence | ✅ Operator confirmed | Headless smoke + filmstrip witness |
-| Route receipt emission | ✅ Kit-authoritative receipt: staged profile, output hashes, weights identity (SHA-256 of the loaded binary) | Asserted live against `validateRouteReceipt` + `assertAuthoritativeRouteReceipt` |
+| Route receipt emission | ✅ Kit-authoritative receipt: staged profile, output hashes, weights identity (SHA-256 of the loaded binary), backend identity validated at emission | Asserted live against `validateRouteReceipt` + `assertAuthoritativeRouteReceipt` |
 | Failure-path behavior | ✅ Dead endpoint yields a terminal `failed` receipt, not a timeout | Live probe in `tools/headless_smoke.mjs` |
+| Bounded GPU submission | ✅ One command buffer per transformer pass, ≤2 in flight, drained report on every exit; 1.85× on a 6 s clip | `tests/test_submission_pacing.mjs` + perf witness; fresh-context review, no material findings |
+| Host-callable producer | ✅ Borrowed device never destroyed; whole-operation cancellation; host submits fenced before any failure; producer-owned cleanup only | `tests/test_producer.mjs` (39 checks, all failure paths fail-first); three fresh-context review rounds, clean at `f3f8075` |
 
 ## Automated tests
 
@@ -214,9 +265,15 @@ python tests/test_convert_weights_guard.py    # converter single-writer atomicit
 python3 tests/test_local_scripts.py           # setup/run scripts: port ownership, supervision, phase repair
 node tests/test_route_receipt_contract.mjs    # receipt validity, authority, hashing, kit contract
 node tests/test_generation_identity.mjs       # generation lifecycle + terminal-state classifier
+node tests/test_generation_lifecycle.mjs      # single-flight owner: publish/settle ownership, sink exceptions
+node tests/test_motion_export_state.mjs       # window.__kimodoMotionState classification
+node tests/test_kit_integration.mjs           # kit identity as receipt backend; emission-time validation
+node --import ./tests/wgsl-loader.mjs tests/test_submission_pacing.mjs  # bounded submission: duty ids, fences, scratch reuse
+node --import ./tests/wgsl-loader.mjs tests/test_producer.mjs           # host-callable producer contract (fake device)
+npm run test:kit-route-contract               # route definition parity with the kit's Kimodo factory
 ```
 
-The two contract tests stub the text encoder and run in seconds. They assert
+The two suites that import the shaders go through `tests/wgsl-loader.mjs`, which stubs Vite's `?raw` imports so the shipped modules run under plain Node. The Python contract tests stub the text encoder and run in seconds. They assert
 the failure paths rather than the happy path: that the server binds loopback
 only, that malformed requests get stable 400s, that non-finite or wrong-length
 embeddings are refused rather than served, and that an incompatible sidecar
@@ -229,10 +286,12 @@ serialized against each other — run one at a time per output path.
 
 ## What's next
 
-- [ ] Performance: reduce per-step GPU-CPU sync overhead
+- [x] Performance: reduce per-step GPU-CPU sync overhead — bounded submission, one duty per pass (1.85× on a 6 s clip)
+- [x] Runtime primitives from `@kaminos/webgpu-inference-kit` (submission pacing, backend identity, route receipts)
+- [ ] Compose with a live host scene: `createKimodoProducer` on a borrowed device, host work interleaved at the foreground boundary (in progress in Kaminos)
+- [ ] Shared kernel package with moge-webgpu (kernels are still local WGSL)
 - [ ] Client-side text embedding (quantized Llama in browser via WebLLM)
 - [ ] 3D skeleton renderer (Three.js WebGPU)
-- [ ] Shared kernel package with moge-webgpu (`@kaminos/webgpu-inference-kit`)
 - [ ] Batch CFG (4→2 forward passes per step by batching cond/uncond)
 
 ## License
