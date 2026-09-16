@@ -16,7 +16,10 @@ function frozenSnapshot(state) {
   return Object.freeze(snapshot);
 }
 
-function terminalSubmissionProblem(submission) {
+function terminalSubmissionProblem(submission, {
+  expectedProducerDutyCount,
+  requestedMaxInFlightDuties,
+}) {
   if (submission == null) {
     return {
       code: 'submission-report-missing',
@@ -44,9 +47,12 @@ function terminalSubmissionProblem(submission) {
   ));
   const incoherent = !malformed && (
     submission.maxInFlightDuties <= 0
+    || submission.maxInFlightDuties !== requestedMaxInFlightDuties
     || submission.maxObservedInFlightDuties > submission.maxInFlightDuties
+    || submission.maxObservedInFlightDuties > submission.submittedDutyCount
     || submission.inFlightDutyCount !== 0
     || submission.failedDutyCount !== 0
+    || submission.submittedDutyCount !== expectedProducerDutyCount
     || submission.completedDutyCount !== submission.submittedDutyCount
   );
   if (malformed || incoherent) {
@@ -173,7 +179,10 @@ export function createFrontendTelemetry({
           actualGenerationId: receipt.generationId,
         };
       } else {
-        problem = terminalSubmissionProblem(submission);
+        problem = terminalSubmissionProblem(submission, {
+          expectedProducerDutyCount: numSteps * 4,
+          requestedMaxInFlightDuties,
+        });
       }
 
       if (problem) {

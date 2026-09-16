@@ -83,6 +83,11 @@ const submission = {
   inFlightDutyCount: 0,
   hostSubmissionCount: 0,
 };
+const oneStepSubmission = {
+  ...submission,
+  submittedDutyCount: 4,
+  completedDutyCount: 4,
+};
 telemetry.succeed({
   status: 'real',
   generationId: 7,
@@ -159,7 +164,44 @@ check('a failed bounded-submission report cannot publish success',
     && failedSubmission.failure?.code === 'submission-report-nonterminal',
   JSON.stringify(failedSubmission));
 
-const sameGenerationDrained = terminalProbe(7, 7, submission);
+const peakExceedsLifetime = terminalProbe(7, 7, {
+  ...oneStepSubmission,
+  submittedDutyCount: 1,
+  completedDutyCount: 1,
+  maxObservedInFlightDuties: 2,
+});
+check('an observed peak above lifetime submitted duties cannot publish success',
+  peakExceedsLifetime.status !== 'succeeded'
+    && peakExceedsLifetime.failure?.code === 'submission-report-invalid',
+  JSON.stringify(peakExceedsLifetime));
+
+const zeroDutySubmission = terminalProbe(7, 7, {
+  ...oneStepSubmission,
+  submittedDutyCount: 0,
+  completedDutyCount: 0,
+  maxObservedInFlightDuties: 0,
+});
+check('a zero-duty report for a positive-step generation cannot publish success',
+  zeroDutySubmission.status !== 'succeeded'
+    && zeroDutySubmission.failure?.code === 'submission-report-invalid',
+  JSON.stringify(zeroDutySubmission));
+
+const wrongDutyCount = terminalProbe(7, 7, submission);
+check('a drained report with the wrong producer-duty count cannot publish success',
+  wrongDutyCount.status !== 'succeeded'
+    && wrongDutyCount.failure?.code === 'submission-report-invalid',
+  JSON.stringify(wrongDutyCount));
+
+const wrongCapacity = terminalProbe(7, 7, {
+  ...oneStepSubmission,
+  maxInFlightDuties: 3,
+});
+check('a drained report from a different queue capacity cannot publish success',
+  wrongCapacity.status !== 'succeeded'
+    && wrongCapacity.failure?.code === 'submission-report-invalid',
+  JSON.stringify(wrongCapacity));
+
+const sameGenerationDrained = terminalProbe(7, 7, oneStepSubmission);
 check('a same-generation real receipt with a drained report remains successful',
   sameGenerationDrained.status === 'succeeded'
     && sameGenerationDrained.failure === null
