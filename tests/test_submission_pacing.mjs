@@ -375,4 +375,54 @@ async function measureForward(frames, { failSubmit = false } = {}) {
     JSON.stringify({ declIdx, tryIdx }));
 }
 
+// --- Partial acquisition must not leak (at-cap closure slice) --------------
+// r4 finding: textBuf and zeroTextBuf were both created BEFORE the ownership
+// guard, so a failure creating the second leaked the first. Acquisition now
+// happens inside the guard; both injected-allocation orders are pinned.
+
+async function denoiseWithFailingAllocation(failAt) {
+  let created = 0;
+  const live = new Set();
+  const passEncoder = { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {}, end() {} };
+  const device = {
+    createShaderModule: () => ({}),
+    createComputePipeline: () => ({ getBindGroupLayout: () => ({}) }),
+    createBindGroup: () => ({}),
+    createBuffer: (desc) => {
+      created += 1;
+      if (created === failAt) throw new Error(`injected allocation ${failAt} failure`);
+      const buf = { size: desc.size, destroy() { live.delete(buf); },
+        mapAsync: async () => {}, getMappedRange: () => new ArrayBuffer(desc.size), unmap() {} };
+      live.add(buf);
+      return buf;
+    },
+    createCommandEncoder: () => ({ copyBufferToBuffer() {}, beginComputePass: () => passEncoder, finish: () => ({}) }),
+    queue: { submit() {}, onSubmittedWorkDone: async () => {}, writeBuffer() {} },
+    limits: {},
+  };
+  const stats = {
+    fps: 30,
+    global_root_mean: [0, 0, 0, 0, 0], global_root_std: [1, 1, 1, 1, 1],
+    local_root_mean: [0, 0, 0, 0], local_root_std: [1, 1, 1, 1],
+  };
+  const motion = Array.from({ length: 2 }, () => new Array(369).fill(0));
+  let error = null;
+  try {
+    await denoiseStepWebGPU(device, { root: fakeWeights(), body: fakeWeights() },
+      new Float32Array(8), motion, 500, stats, {});
+  } catch (err) { error = err; }
+  return { error, liveCount: live.size };
+}
+
+{
+  const first = await denoiseWithFailingAllocation(1);
+  check('failure of the FIRST step allocation propagates with nothing live',
+    /injected allocation 1/.test(first.error?.message ?? '') && first.liveCount === 0,
+    JSON.stringify({ e: first.error?.message, live: first.liveCount }));
+  const second = await denoiseWithFailingAllocation(2);
+  check('failure of the SECOND step allocation destroys the first (no partial-acquisition leak)',
+    /injected allocation 2/.test(second.error?.message ?? '') && second.liveCount === 0,
+    JSON.stringify({ e: second.error?.message, live: second.liveCount }));
+}
+
 process.exit(failures ? 1 : 0);

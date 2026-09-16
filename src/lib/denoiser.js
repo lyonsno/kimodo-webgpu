@@ -150,21 +150,25 @@ export async function denoiseStepWebGPU(device, weights, textEmbedding, motion, 
 
   const textArr = textEmbedding instanceof Float32Array ? textEmbedding : new Float32Array(textEmbedding);
   console.log('[denoiser] textArr input[0:5]: ' + JSON.stringify([textArr[0], textArr[1], textArr[2], textArr[3], textArr[4]]));
-  const textBuf = createStorageBuffer(device, textArr);
-  const zeroTextBuf = createStorageBuffer(device, new Float32Array(textArr.length));
-
+  // Acquisition happens INSIDE the ownership guard: creating the second
+  // buffer can itself fail, and the first must still be reclaimed (the
+  // partial-acquisition hole the at-cap review pinned).
+  let textBuf = null;
+  let zeroTextBuf = null;
   let condOutput;
   let uncondOutput;
   try {
+    textBuf = createStorageBuffer(device, textArr);
+    zeroTextBuf = createStorageBuffer(device, new Float32Array(textArr.length));
     // Conditioned pass: real text
     condOutput = await runTwoStage(device, weights, motion, textBuf, timestep, N, stats, { ...options, cfgRole: 'cond' });
     // Unconditioned pass: zeroed text
     uncondOutput = await runTwoStage(device, weights, motion, zeroTextBuf, timestep, N, stats, { ...options, cfgRole: 'uncond' });
   } finally {
-    // Step-owned buffers are reclaimed on every path: a rejected submission
-    // or readback must not leak the text/input buffers (r3 finding).
-    textBuf.destroy();
-    zeroTextBuf.destroy();
+    // Step-owned buffers are reclaimed on every path, including a failure
+    // while acquiring the second of the pair.
+    if (textBuf) textBuf.destroy();
+    if (zeroTextBuf) zeroTextBuf.destroy();
   }
 
   // CFG: out = uncond + w * (cond - uncond), w=2.0
