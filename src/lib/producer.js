@@ -23,6 +23,7 @@ import { createWebGpuBoundedSubmissionQueue, WEBGPU_INFERENCE_KIT_VERSION } from
 const MODEL_ID = 'NVIDIA/Kimodo-SOMA-RP-v1.1';
 const MODEL_REVISION = 'SOMA-RP-v1.1';
 const MOTION_DIM = 369; // root(5) + body(364)
+export const KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES = 2;
 
 export class KimodoProducerError extends Error {
   constructor(phase, message) {
@@ -311,7 +312,7 @@ export async function createKimodoProducer(input = {}) {
         profile.start('ddim-sampling');
         submissions = createWebGpuBoundedSubmissionQueue({
           queue,
-          maxInFlightDuties: opts.maxInFlightDuties ?? 2,
+          maxInFlightDuties: opts.maxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES,
           signal: gpuAbort.signal,
         });
         boundaryOpen = true;

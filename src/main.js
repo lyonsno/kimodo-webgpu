@@ -7,9 +7,10 @@
  */
 
 import { initGPU } from './lib/gpu.js';
-import { createKimodoProducer } from './lib/producer.js';
+import { createKimodoProducer, KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES } from './lib/producer.js';
 import { describeInvalidReceipt } from './lib/route-receipt.js';
 import { classifyGenerationState, classifyMotionExport, createGenerationLifecycle } from './lib/generation-state.js';
+import { createFrontendTelemetry, KIMODO_FRONTEND_TELEMETRY_SCHEMA, KIMODO_ROUTE_ID } from './lib/frontend-telemetry.js';
 
 // The single choke point every watcher (smoke harnesses, live probes) uses to
 // decide whether the generation it is watching has terminally settled. Keeping
@@ -33,6 +34,83 @@ const statusEl = document.getElementById('status');
 const infoEl = document.getElementById('info');
 const progressBar = document.getElementById('progress-bar');
 const generateBtn = document.getElementById('generate-btn');
+const routeStateEl = document.getElementById('route-state');
+const schedulerStateEl = document.getElementById('scheduler-state');
+const foregroundStateEl = document.getElementById('foreground-state');
+const gpuQueueStateEl = document.getElementById('gpu-queue-state');
+const timingStateEl = document.getElementById('timing-state');
+
+window.__kimodoFrontendTelemetry = Object.freeze({
+  schema: KIMODO_FRONTEND_TELEMETRY_SCHEMA,
+  source: 'live-page-generation',
+  status: 'idle',
+  route: Object.freeze({ requestedRouteId: KIMODO_ROUTE_ID, effectiveRouteId: null, receiptStatus: null }),
+});
+
+let activeTelemetry = null;
+let telemetryFramePending = false;
+
+function formatMs(value) {
+  if (!Number.isFinite(value)) return 'unreported';
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`;
+}
+
+function renderTelemetry(snapshot) {
+  window.__kimodoFrontendTelemetry = snapshot;
+  const state = snapshot.status ?? 'idle';
+  const route = snapshot.route ?? {};
+  const scheduler = snapshot.scheduler ?? {};
+  const submission = snapshot.submission;
+  const progress = snapshot.progress;
+
+  routeStateEl.dataset.state = state;
+  schedulerStateEl.dataset.state = state;
+  foregroundStateEl.dataset.state = state;
+  gpuQueueStateEl.dataset.state = state;
+  timingStateEl.dataset.state = state;
+
+  routeStateEl.textContent = `${route.effectiveRouteId ?? route.requestedRouteId ?? KIMODO_ROUTE_ID} · ${route.receiptStatus ?? state}`;
+  schedulerStateEl.textContent = `${scheduler.mode ?? 'cooperative-foreground-boundary'} · ${state}`
+    + (progress ? ` · step ${progress.step}/${progress.numSteps}` : '');
+  foregroundStateEl.textContent = `${scheduler.observedForegroundBoundaryCount ?? 0}/${scheduler.expectedForegroundBoundaryCount ?? '?'} boundaries observed`
+    + (scheduler.lastBoundary?.pass ? ` · last ${scheduler.lastBoundary.pass}` : '')
+    + ` · host submits ${scheduler.hostSubmissionCount ?? 'unreported'}`;
+
+  if (submission) {
+    gpuQueueStateEl.textContent = `${submission.status ?? 'unreported'} · ${submission.completedDutyCount ?? '?'} completed / ${submission.submittedDutyCount ?? '?'} submitted`
+      + ` · ${submission.failedDutyCount ?? '?'} failed · ${submission.inFlightDutyCount ?? '?'} in flight`
+      + ` · peak ${submission.maxObservedInFlightDuties ?? '?'}/${submission.maxInFlightDuties ?? scheduler.requestedMaxInFlightDuties ?? '?'}`;
+  } else {
+    gpuQueueStateEl.textContent = `bounded submission · terminal report pending · configured max ${scheduler.requestedMaxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES}`;
+  }
+
+  if (snapshot.timings?.length) {
+    timingStateEl.textContent = snapshot.timings
+      .map((stage) => `${stage.name} ${formatMs(stage.durationMs)}`)
+      .join(' · ');
+  } else {
+    timingStateEl.textContent = `${snapshot.currentStage ?? 'idle'} · elapsed ${formatMs(snapshot.elapsedMs)}`;
+  }
+}
+
+function scheduleTelemetryRender() {
+  if (telemetryFramePending || !activeTelemetry) return;
+  telemetryFramePending = true;
+  requestAnimationFrame(() => {
+    telemetryFramePending = false;
+    if (activeTelemetry) renderTelemetry(activeTelemetry.snapshot());
+  });
+}
+
+function renderTerminalTelemetry(receipt, submission) {
+  activeTelemetry?.succeed(receipt, submission);
+  if (activeTelemetry) renderTelemetry(activeTelemetry.snapshot());
+}
+
+function renderFailureTelemetry(err) {
+  activeTelemetry?.fail(err);
+  if (activeTelemetry) renderTelemetry(activeTelemetry.snapshot());
+}
 
 let gpuDevice = null;
 let gpuAdapter = null;
@@ -131,6 +209,13 @@ async function generate() {
     const numSteps = parseInt(document.getElementById('steps').value) || 100;
     const embedUrl = `${document.getElementById('server-url').value.trim()}/embed`;
 
+    activeTelemetry = createFrontendTelemetry({
+      generationId,
+      numSteps,
+      requestedMaxInFlightDuties: KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES,
+    });
+    renderTelemetry(activeTelemetry.snapshot());
+
     generateBtn.disabled = true;
     progressBar.style.width = '0%';
     const t0 = performance.now();
@@ -142,6 +227,8 @@ async function generate() {
       generationId,
       embedUrl,
       onStage: (name, event) => {
+        activeTelemetry.stage(name, event);
+        scheduleTelemetryRender();
         if (event !== 'start') return;
         statusEl.textContent = {
           'text-embedding': 'Requesting text embedding from server...',
@@ -150,7 +237,17 @@ async function generate() {
           'output-capture': 'Capturing output...',
         }[name] ?? name;
       },
-      onProgress: async ({ step, pct }) => {
+      foregroundOpportunity: (boundary) => {
+        // The standalone smoke has no host scene to submit. Observing every
+        // producer boundary proves the cooperative seam is exercised without
+        // counterfeiting host GPU work; the terminal producer report remains
+        // authoritative for bounded-queue counts.
+        activeTelemetry.foreground(boundary);
+        scheduleTelemetryRender();
+      },
+      onProgress: async ({ step, numSteps: reportedNumSteps, pct }) => {
+        activeTelemetry.progress({ step, numSteps: reportedNumSteps, pct });
+        scheduleTelemetryRender();
         progressBar.style.width = `${pct}%`;
         statusEl.textContent = `WebGPU DDIM step ${step}/${numSteps} (${pct}%)`;
         // The route's declared per-diffusion-step cooperative checkpoint: one
@@ -161,6 +258,7 @@ async function generate() {
 
     const genTime = ((performance.now() - t0) / 1000).toFixed(1);
     const { receipt, motion } = result;
+    renderTerminalTelemetry(receipt, result.submission);
     progressBar.style.width = '100%';
     renderSkeletonFromJoints({
       joints: motion.joints, parents: motion.parents,
@@ -191,6 +289,7 @@ async function generate() {
     // terminal bounded-submission report; the original error stays
     // authoritative and the report rides the failure evidence.
     const phase = err?.phase ?? 'exception';
+    renderFailureTelemetry(err);
     run.publishFailure(phase, err.message, err?.gpuSubmission ? { gpuSubmission: err.gpuSubmission } : null);
     statusEl.textContent = `Error: ${err.message}`;
     const help = EMBEDDING_HELP[phase];

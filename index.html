@@ -40,6 +40,13 @@ button:disabled { background: #333; color: #666; cursor: not-allowed; }
 #progress { height: 4px; background: #252525; border-radius: 2px; margin-bottom: 8px; overflow: hidden; }
 #progress-bar { height: 100%; background: #1976d2; width: 0%; transition: width 0.3s; }
 #info { font-size: 10px; color: #555; font-family: 'SF Mono', monospace; }
+.evidence-title { color: #aaa; font-size: 11px; font-weight: 700; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.06em; }
+.evidence-grid { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 6px 8px; font-family: 'SF Mono', monospace; font-size: 10px; line-height: 1.35; }
+.evidence-grid dt { color: #666; }
+.evidence-grid dd { color: #aaa; min-width: 0; overflow-wrap: anywhere; }
+.evidence-grid dd[data-state="running"] { color: #64b5f6; }
+.evidence-grid dd[data-state="succeeded"] { color: #81c784; }
+.evidence-grid dd[data-state="failed"], .evidence-grid dd[data-state="invalid"], .evidence-grid dd[data-state="cancelled"] { color: #ef9a9a; }
 canvas { border-radius: 8px; }
 </style>
 </head>
@@ -67,6 +74,17 @@ canvas { border-radius: 8px; }
     <button id="generate-btn" onclick="generate()" disabled>Generate Motion</button>
     <div id="progress"><div id="progress-bar"></div></div>
     <div id="info"></div>
+
+    <section class="panel" id="runtime-evidence" aria-live="polite" aria-label="Live runtime evidence">
+      <div class="evidence-title">Runtime evidence</div>
+      <dl class="evidence-grid">
+        <dt>Route</dt><dd id="route-state">kimodo.text-to-motion.webgpu-local.v0 · idle</dd>
+        <dt>Scheduler</dt><dd id="scheduler-state">cooperative foreground boundary · not started</dd>
+        <dt>Foreground</dt><dd id="foreground-state">0 boundaries observed · host submits unreported</dd>
+        <dt>GPU queue</dt><dd id="gpu-queue-state">bounded submission · terminal report pending</dd>
+        <dt>Timings</dt><dd id="timing-state">no live generation</dd>
+      </dl>
+    </section>
   </div>
   <div id="viewport">
     <div id="status">Initializing WebGPU...</div>
