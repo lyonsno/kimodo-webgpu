@@ -90,6 +90,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   let submitted = false;
 
   try {
+    if(options.timing)options.timing.encodeStartedAtMs=performance.now();
     const enc = device.createCommandEncoder();
 
     // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
@@ -202,12 +203,14 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
 
     // The pass's single submission: one command buffer, one duty.
     const commandBuffer = enc.finish();
+    if(options.timing)options.timing.encodeEndedAtMs=performance.now();
     if (submissions) {
       await submissions.submitDuty({ dutyId: options.dutyId, commandBuffers: [commandBuffer] });
     } else {
       device.queue.submit([commandBuffer]);
     }
     submitted = true;
+    if(options.timing)options.timing.admittedAtMs=performance.now();
 
     return finalOutBuf;
   } finally {

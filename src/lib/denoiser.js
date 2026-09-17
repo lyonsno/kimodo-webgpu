@@ -72,9 +72,12 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   // Caller-owned duty identity: unique per generation across steps, CFG
   // roles, and submodels — the installed controller rejects duplicates for
   // its lifetime, and the first cut collided cond/uncond root passes.
-  const dutyFor = (submodel) => (options.submissions
-    ? { submissions: options.submissions, dutyId: `${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}` }
-    : {});
+  const dutyFor = (submodel) => {
+    const dutyId=`${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}`;
+    const timing=options.passTimings ? {dutyId,pass:`${options.cfgRole ?? 'cfg'}-${submodel}`} : null;
+    if(timing)options.passTimings.push(timing); // partial rows survive failure
+    return {submissions:options.submissions,dutyId,timing};
+  };
   const motionDim = 369;
 
   // --- Root model: input = [motion(369), zeros(369)] = [N, 738] ---
@@ -90,12 +93,15 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   let rootPred;
   {
     let rootOutBuf = null;
+    const duty=dutyFor('root');
     try {
-      rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, dutyFor('root'));
+      rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, duty);
       // Foreground boundary: the pass's duty is admitted; a host may place
       // its own work (e.g. a live frame) on the shared queue here.
       if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-root` });
+      if(duty.timing)duty.timing.boundaryEndedAtMs=performance.now();
       rootPred = await readBuffer(device, rootOutBuf, N * 5);
+      if(duty.timing)duty.timing.readbackCompletedAtMs=performance.now();
     } finally {
       rootInputBuf.destroy();
       if (rootOutBuf) rootOutBuf.destroy();
@@ -123,10 +129,13 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   let bodyPred;
   {
     let bodyOutBuf = null;
+    const duty=dutyFor('body');
     try {
-      bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, dutyFor('body'));
+      bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, duty);
       if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-body` });
+      if(duty.timing)duty.timing.boundaryEndedAtMs=performance.now();
       bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
+      if(duty.timing)duty.timing.readbackCompletedAtMs=performance.now();
     } finally {
       bodyInputBuf.destroy();
       if (bodyOutBuf) bodyOutBuf.destroy();

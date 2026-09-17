@@ -297,6 +297,9 @@ export async function createKimodoProducer(input = {}) {
     };
 
     let gpuSubmissionSummary = null;
+    // These are page-clock diagnostics, not isolated GPU execution timestamps.
+    // Keep full rows outside the compact receipt; never truncate an open trace.
+    const diagnostics={clock:'performance.now',timeOrigin:performance.timeOrigin,passes:[],submissionReport:null};
     let motion;
     let submissions = null;
     try { // whole-operation scope: the abort bridge lives until this returns or throws
@@ -327,6 +330,7 @@ export async function createKimodoProducer(input = {}) {
             {
               submissions,
               dutyPrefix: `g${generationId}-s${n}`,
+              passTimings: diagnostics.passes,
               // Foreground-opportunity boundary between admitted duties: the
               // host may submit its own work on the shared queue here.
               afterPass: opts.foregroundOpportunity
@@ -350,6 +354,7 @@ export async function createKimodoProducer(input = {}) {
         }
         boundaryOpen = false;
         const report = await submissions.drain();
+        diagnostics.submissionReport=report;
         gpuSubmissionSummary = { ...summarizeSubmissionReport(report), hostSubmissionCount: hostFences.length };
       } catch (err) {
         // Stop admission, revoke the host's submit, settle accepted producer
@@ -358,8 +363,8 @@ export async function createKimodoProducer(input = {}) {
         boundaryOpen = false;
         gpuAbort.abort();
         if (submissions) {
-          try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
-          catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
+          try { diagnostics.submissionReport=await submissions.drain();gpuSubmissionSummary = summarizeSubmissionReport(diagnostics.submissionReport); }
+          catch (drainErr) { diagnostics.submissionReport=drainErr?.boundedGpuSubmissionReport ?? null;gpuSubmissionSummary = summarizeSubmissionReport(diagnostics.submissionReport, drainErr); }
         }
         await Promise.allSettled(hostFences);
         if (gpuSubmissionSummary) gpuSubmissionSummary.hostSubmissionCount = hostFences.length;
@@ -418,8 +423,10 @@ export async function createKimodoProducer(input = {}) {
           numJoints: decoded.num_joints,
         },
         submission: gpuSubmissionSummary,
+        diagnostics,
       };
     } catch (err) {
+      err.diagnostics=diagnostics;
       if (err instanceof KimodoProducerError && err.gpuSubmission === undefined) err.gpuSubmission = gpuSubmissionSummary;
       throw err;
     } finally {

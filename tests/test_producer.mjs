@@ -164,6 +164,14 @@ async function makeProducer(counters, extra = {}) {
     result.receipt?.status === 'real' && result.receipt?.metadata?.gpuSubmission?.submittedDutyCount === 12
       && result.receipt?.model?.weightsHash === 'f'.repeat(64),
     JSON.stringify({ status: result.receipt?.status, sub: result.receipt?.metadata?.gpuSubmission }));
+  check('diagnostics retain every pass and raw kit duty on the page performance clock',
+    result.diagnostics?.passes?.length === 12 && result.diagnostics?.submissionReport?.duties?.length === 12
+      && result.diagnostics.clock === 'performance.now'
+      && result.diagnostics.passes.every(p => p.encodeStartedAtMs <= p.encodeEndedAtMs
+        && p.encodeEndedAtMs <= p.admittedAtMs && p.admittedAtMs <= p.boundaryEndedAtMs
+        && p.boundaryEndedAtMs <= p.readbackCompletedAtMs
+        && result.diagnostics.submissionReport.duties.some(d => d.dutyId === p.dutyId)),
+    JSON.stringify(result.diagnostics));
   producer.dispose();
   check('dispose after generation still never destroys the device', counters.deviceDestroyed === 0);
 }
