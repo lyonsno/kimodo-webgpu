@@ -243,6 +243,11 @@ export async function createKimodoProducer(input = {}) {
     const numSteps = Math.max(1, parseInt(opts.steps ?? 100, 10));
     const duration = Number(opts.duration ?? 6);
     const numFrames = Math.max(1, Math.round(duration * config.fps));
+    const layersPerDuty = opts.layersPerDuty ?? 16;
+    if (layersPerDuty !== 4 && layersPerDuty !== 16) {
+      throw new KimodoProducerError('input', 'layersPerDuty must be exactly 4 or 16');
+    }
+    const chunksPerPass = 16 / layersPerDuty;
     const generationId = opts.generationId ?? ++generationCounter;
     const signal = opts.signal ?? null;
     // The effective endpoint is recorded on the receipt; a per-generation
@@ -299,7 +304,13 @@ export async function createKimodoProducer(input = {}) {
     let gpuSubmissionSummary = null;
     // These are page-clock diagnostics, not isolated GPU execution timestamps.
     // Keep full rows outside the compact receipt; never truncate an open trace.
-    const diagnostics={clock:'performance.now',timeOrigin:performance.timeOrigin,passes:[],submissionReport:null};
+    const diagnostics={
+      clock:'performance.now',
+      timeOrigin:performance.timeOrigin,
+      scheduling:{layersPerDuty,chunksPerPass},
+      passes:[],
+      submissionReport:null,
+    };
     let motion;
     let submissions = null;
     try { // whole-operation scope: the abort bridge lives until this returns or throws
@@ -331,12 +342,13 @@ export async function createKimodoProducer(input = {}) {
               submissions,
               dutyPrefix: `g${generationId}-s${n}`,
               passTimings: diagnostics.passes,
+              layersPerDuty,
               // Foreground-opportunity boundary between admitted duties: the
               // host may submit its own work on the shared queue here.
               afterPass: opts.foregroundOpportunity
-                ? ({ pass }) => raceAbort(opts.foregroundOpportunity({
+                ? (chunk) => raceAbort(opts.foregroundOpportunity({
                   submit: hostSubmit, signal: gpuAbort.signal,
-                  phase: 'ddim-sampling', step: n, numSteps, pass,
+                  phase: 'ddim-sampling', step: n, numSteps, ...chunk,
                 }))
                 : undefined,
             },

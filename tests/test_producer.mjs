@@ -133,10 +133,16 @@ async function makeProducer(counters, extra = {}) {
     prompt: 'a person walks forward',
     steps: 3,
     duration: 0.1, // 3 frames at 30fps
+    layersPerDuty: 4,
     onStage: (name, event) => stages.push(`${name}:${event}`),
     onProgress: (p) => progress.push(p),
     foregroundOpportunity: async (b) => {
-      boundaries.push({ phase: b.phase, step: b.step, pass: b.pass, hasSubmit: typeof b.submit === 'function', hasSignal: !!b.signal });
+      boundaries.push({
+        phase: b.phase, step: b.step, pass: b.pass,
+        chunkIndex: b.chunkIndex, chunkCount: b.chunkCount,
+        layerStart: b.layerStart, layerEnd: b.layerEnd,
+        hasSubmit: typeof b.submit === 'function', hasSignal: !!b.signal,
+      });
       b.submit([{}]); // host advances its flame on the shared queue
     },
   });
@@ -150,10 +156,13 @@ async function makeProducer(counters, extra = {}) {
     progress.length === 3 && progress.every((p) => p.numSteps === 3) && progress.at(-1).step === 3,
     JSON.stringify(progress));
   check('foreground boundary fires between admitted duties with submit + signal',
-    boundaries.length === 3 * 4 && boundaries.every((b) => b.hasSubmit && b.hasSignal && b.phase === 'ddim-sampling'),
+    boundaries.length === 3 * 4 * 4
+      && boundaries.every((b) => b.hasSubmit && b.hasSignal && b.phase === 'ddim-sampling'
+        && b.chunkCount === 4 && b.layerStart === (b.chunkIndex - 1) * 4
+        && b.layerEnd === b.chunkIndex * 4),
     `boundaries=${boundaries.length} ${JSON.stringify(boundaries[0])}`);
   check('host submissions on the shared queue reach the device queue',
-    counters.queueSubmits >= 3 * 4 + 3 * 4, `queueSubmits=${counters.queueSubmits}`);
+    counters.queueSubmits >= 3 * 4 * 4 + 3 * 4 * 4, `queueSubmits=${counters.queueSubmits}`);
   check('native motion result carries joints/rows/parents/counts/fps',
     result.motion?.joints?.length === 3 && result.motion.joints[0].length === 30
       && result.motion.motion.length === 3 && result.motion.motion[0].length === 369
@@ -161,13 +170,15 @@ async function makeProducer(counters, extra = {}) {
       && result.motion.numFrames === 3 && result.motion.numJoints === 30,
     JSON.stringify({ frames: result.motion?.joints?.length, joints: result.motion?.joints?.[0]?.length }));
   check('receipt is terminal and carries submission telemetry and identity',
-    result.receipt?.status === 'real' && result.receipt?.metadata?.gpuSubmission?.submittedDutyCount === 12
+    result.receipt?.status === 'real' && result.receipt?.metadata?.gpuSubmission?.submittedDutyCount === 48
       && result.receipt?.model?.weightsHash === 'f'.repeat(64),
     JSON.stringify({ status: result.receipt?.status, sub: result.receipt?.metadata?.gpuSubmission }));
   check('diagnostics retain every pass and raw kit duty on the page performance clock',
-    result.diagnostics?.passes?.length === 12 && result.diagnostics?.submissionReport?.duties?.length === 12
+    result.diagnostics?.passes?.length === 48 && result.diagnostics?.submissionReport?.duties?.length === 48
       && result.diagnostics.clock === 'performance.now'
-      && result.diagnostics.passes.every(p => p.encodeStartedAtMs <= p.encodeEndedAtMs
+      && result.diagnostics.passes.every(p => p.chunkCount === 4
+        && p.layerStart === (p.chunkIndex - 1) * 4 && p.layerEnd === p.chunkIndex * 4
+        && p.encodeStartedAtMs <= p.encodeEndedAtMs
         && p.encodeEndedAtMs <= p.admittedAtMs && p.admittedAtMs <= p.boundaryEndedAtMs
         && p.boundaryEndedAtMs <= p.readbackCompletedAtMs
         && result.diagnostics.submissionReport.duties.some(d => d.dutyId === p.dutyId)),

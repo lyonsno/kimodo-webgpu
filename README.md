@@ -206,17 +206,22 @@ const producer = await createKimodoProducer({
 
 const { receipt, motion } = await producer.generate({
   prompt: 'a person walks forward', steps: 50, duration: 6,
+  layersPerDuty: 16,                  // default; use 4 only for explicit cooperative chunking
   signal,                              // AbortSignal — governs the whole call
   onProgress: ({ step, numSteps }) => {},
-  foregroundOpportunity: async ({ submit, phase, step, pass }) => {
-    submit([hostCommandBuffer]);       // runs after the admitted producer pass, before its readback
+  foregroundOpportunity: async ({ submit, phase, step, pass, chunkIndex, chunkCount }) => {
+    submit([hostCommandBuffer]);       // runs after this admitted duty, before the pass readback
   },
 });
 producer.dispose();                    // destroys producer-owned weights only
 ```
 
-`foregroundOpportunity` fires after every admitted transformer pass (four per
-DDIM step). Its `submit` is fenced — a failure never rejects before the host's
+By default, `foregroundOpportunity` fires after every admitted transformer
+pass (four per DDIM step). Explicit `layersPerDuty: 4` preserves the same 16
+ordered layers and numerical work while admitting four duties per pass; the
+callback then carries `dutyId`, `chunkIndex`, `chunkCount`, `layerStart`, and
+`layerEnd` for each of the 16 boundaries per step. Other values fail loud.
+Its `submit` is fenced — a failure never rejects before the host's
 accepted work has completed — and is revoked once the generation settles.
 Every error is a `KimodoProducerError` with a `phase` (`load-weights`,
 `embedding-http`, `cancelled`, `ddim-sampling`, …) and, after sampling

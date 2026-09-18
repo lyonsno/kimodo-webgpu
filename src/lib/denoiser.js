@@ -74,9 +74,15 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   // its lifetime, and the first cut collided cond/uncond root passes.
   const dutyFor = (submodel) => {
     const dutyId=`${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}`;
-    const timing=options.passTimings ? {dutyId,pass:`${options.cfgRole ?? 'cfg'}-${submodel}`} : null;
-    if(timing)options.passTimings.push(timing); // partial rows survive failure
-    return {submissions:options.submissions,dutyId,timing};
+    const pass=`${options.cfgRole ?? 'cfg'}-${submodel}`;
+    return {
+      submissions:options.submissions,
+      dutyId,
+      pass,
+      passTimings:options.passTimings,
+      layersPerDuty:options.layersPerDuty,
+      afterChunk:options.afterPass,
+    };
   };
   const motionDim = 369;
 
@@ -94,14 +100,12 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   {
     let rootOutBuf = null;
     const duty=dutyFor('root');
+    const timingStart=options.passTimings?.length ?? 0;
     try {
       rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, duty);
-      // Foreground boundary: the pass's duty is admitted; a host may place
-      // its own work (e.g. a live frame) on the shared queue here.
-      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-root` });
-      if(duty.timing)duty.timing.boundaryEndedAtMs=performance.now();
       rootPred = await readBuffer(device, rootOutBuf, N * 5);
-      if(duty.timing)duty.timing.readbackCompletedAtMs=performance.now();
+      const readbackCompletedAtMs=performance.now();
+      if(options.passTimings)for(const timing of options.passTimings.slice(timingStart))timing.readbackCompletedAtMs=readbackCompletedAtMs;
     } finally {
       rootInputBuf.destroy();
       if (rootOutBuf) rootOutBuf.destroy();
@@ -130,12 +134,12 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   {
     let bodyOutBuf = null;
     const duty=dutyFor('body');
+    const timingStart=options.passTimings?.length ?? 0;
     try {
       bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, duty);
-      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-body` });
-      if(duty.timing)duty.timing.boundaryEndedAtMs=performance.now();
       bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
-      if(duty.timing)duty.timing.readbackCompletedAtMs=performance.now();
+      const readbackCompletedAtMs=performance.now();
+      if(options.passTimings)for(const timing of options.passTimings.slice(timingStart))timing.readbackCompletedAtMs=readbackCompletedAtMs;
     } finally {
       bodyInputBuf.destroy();
       if (bodyOutBuf) bodyOutBuf.destroy();

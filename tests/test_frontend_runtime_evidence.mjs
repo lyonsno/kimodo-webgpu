@@ -73,6 +73,17 @@ check('live telemetry does not pretend a terminal queue report already exists',
   live.status === 'running' && live.submission === null && live.route.receiptStatus === 'in-progress',
   JSON.stringify(live));
 
+const chunkTelemetry = createFrontendTelemetry({
+  generationId: 8,
+  numSteps: 2,
+  requestedMaxInFlightDuties: 2,
+  boundariesPerStep: 16,
+  now: () => clock,
+});
+check('an explicit chunk schedule publishes its larger expected boundary count',
+  chunkTelemetry.snapshot().scheduler.expectedForegroundBoundaryCount === 32,
+  JSON.stringify(chunkTelemetry.snapshot().scheduler));
+
 const submission = {
   status: 'drained',
   maxInFlightDuties: 2,

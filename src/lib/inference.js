@@ -57,12 +57,10 @@ function positionalEncoding(maxLen, dim = D) {
  *   0.0 = attend, -1e9 = mask out. Used for CFG unconditioned pass (mask text tokens).
  */
 export async function forwardTransformer(device, weights, motionBuf, textBuf, timestep, seqLen, inputDim, outputDim, keyMaskBuf = null, options = {}) {
-  // ONE forward pass = ONE command encoder = ONE duty. Queue submission
-  // order is the only intra-pass correctness requirement, so nothing here
-  // fences the host; the sole lawful fence is readBuffer's, at a real
-  // readback boundary. With a bounded submissions context (the kit's
-  // controller), the single command buffer is admitted as one duty under
-  // the caller-owned identity in options.dutyId.
+  // The default remains one 16-layer forward pass = one command encoder =
+  // one duty. An explicit 4-layer schedule cuts that same ordered command
+  // stream into four duties. Queue order carries every dependency across
+  // chunks; no math, buffer, layer, or readback is added or removed.
   //
   // Memory: per-layer scratch is a FIXED set reused across all 16 layers —
   // serial queue order makes reuse safe, so peak per-pass scratch is one
@@ -79,6 +77,17 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   if (submissions && !options.dutyId) {
     throw new Error('a bounded submissions context requires a caller-owned unique dutyId');
   }
+  const layersPerDuty = options.layersPerDuty ?? 16;
+  if (layersPerDuty !== 4 && layersPerDuty !== 16) {
+    throw new RangeError('layersPerDuty must be exactly 4 or 16');
+  }
+  const chunkCount = 16 / layersPerDuty;
+  if (chunkCount > 1 && !options.dutyId) {
+    throw new Error('chunked transformer admission requires a caller-owned unique dutyId');
+  }
+  if (options.afterChunk != null && typeof options.afterChunk !== 'function') {
+    throw new TypeError('afterChunk must be a function');
+  }
   const numTextTokens = 50; // backbone pads to this fixed size
   const totalSeqLen = numTextTokens + 1 + 1 + seqLen; // padded_text(50) + timestep(1) + heading(1) + motion
   const prefixLen = numTextTokens + 1 + 1; // text + timestep + heading
@@ -87,11 +96,11 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
   const transient = [];
   const own = (buf) => { transient.push(buf); return buf; };
   let finalOutBuf = null;
-  let submitted = false;
+  let returned = false;
 
   try {
-    if(options.timing)options.timing.encodeStartedAtMs=performance.now();
-    const enc = device.createCommandEncoder();
+    const firstEncodeStartedAtMs = performance.now();
+    let enc = device.createCommandEncoder();
 
     // Step 1: Project motion [seqLen, inputDim] -> [seqLen, D]
     const projMotionBuf = own(createEmptyBuffer(device, seqLen * D * 4));
@@ -160,58 +169,84 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     };
     let currentBuf = xseqWithPE;
 
-    for (let layer = 0; layer < 16; layer++) {
-      const lw = weights.layers[layer];
-      const layerOut = (layer % 2 === 0) ? scratch.pingA : scratch.pingB;
+    for (let chunkOffset = 0; chunkOffset < chunkCount; chunkOffset++) {
+      const chunkIndex = chunkOffset + 1;
+      const layerStart = chunkOffset * layersPerDuty;
+      const layerEnd = layerStart + layersPerDuty;
+      const dutyId = chunkCount === 1 ? options.dutyId : `${options.dutyId}-c${chunkIndex}`;
+      const pass = options.pass ?? options.timing?.pass ?? null;
+      const timing = options.passTimings
+        ? { dutyId, pass, chunkIndex, chunkCount, layerStart, layerEnd }
+        : (chunkCount === 1 ? options.timing ?? null : null);
+      if (options.passTimings) options.passTimings.push(timing); // partial rows survive failure
+      if (timing) {
+        timing.dutyId = dutyId;
+        timing.pass = pass;
+        timing.chunkIndex = chunkIndex;
+        timing.chunkCount = chunkCount;
+        timing.layerStart = layerStart;
+        timing.layerEnd = layerEnd;
+        timing.encodeStartedAtMs = chunkOffset === 0 ? firstEncodeStartedAtMs : performance.now();
+      }
+      if (chunkOffset > 0) enc = device.createCommandEncoder();
 
-      // --- Self-attention ---
-      dispatchLinear(device, enc, currentBuf, lw.inProjW, lw.inProjB, {
-        numRows: N, inDim: D, outDim: 3 * D, outputBuf: scratch.qkv,
-      });
-      dispatchQKVSplit(device, enc, scratch.qkv, scratch.q, scratch.k, scratch.v, N, D);
-      dispatchAttention(device, enc, scratch.q, scratch.k, scratch.v, scratch.scores, {
-        N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: scratch.attnOut,
-        maskBuf: keyMaskBuf,
-      });
-      dispatchLinear(device, enc, scratch.attnOut, lw.outProjW, lw.outProjB, {
-        numRows: N, inDim: D, outDim: D, outputBuf: scratch.attnProj,
-      });
-      dispatchAdd(device, enc, currentBuf, scratch.attnProj, scratch.residual1, N * D);
-      dispatchLayerNorm(device, enc, scratch.residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: scratch.afterAttn });
+      for (let layer = layerStart; layer < layerEnd; layer++) {
+        const lw = weights.layers[layer];
+        const layerOut = (layer % 2 === 0) ? scratch.pingA : scratch.pingB;
 
-      // --- FFN ---
-      dispatchLinear(device, enc, scratch.afterAttn, lw.ffn1W, lw.ffn1B, {
-        numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: scratch.ffnUp,
-      });
-      dispatchGELU(device, enc, scratch.ffnUp, N * FFN_DIM);
-      dispatchLinear(device, enc, scratch.ffnUp, lw.ffn2W, lw.ffn2B, {
-        numRows: N, inDim: FFN_DIM, outDim: D, outputBuf: scratch.ffnDown,
-      });
-      dispatchAdd(device, enc, scratch.afterAttn, scratch.ffnDown, scratch.residual2, N * D);
-      dispatchLayerNorm(device, enc, scratch.residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: layerOut });
+        // --- Self-attention ---
+        dispatchLinear(device, enc, currentBuf, lw.inProjW, lw.inProjB, {
+          numRows: N, inDim: D, outDim: 3 * D, outputBuf: scratch.qkv,
+        });
+        dispatchQKVSplit(device, enc, scratch.qkv, scratch.q, scratch.k, scratch.v, N, D);
+        dispatchAttention(device, enc, scratch.q, scratch.k, scratch.v, scratch.scores, {
+          N, D, numHeads: NUM_HEADS, headDim: HEAD_DIM, outputBuf: scratch.attnOut,
+          maskBuf: keyMaskBuf,
+        });
+        dispatchLinear(device, enc, scratch.attnOut, lw.outProjW, lw.outProjB, {
+          numRows: N, inDim: D, outDim: D, outputBuf: scratch.attnProj,
+        });
+        dispatchAdd(device, enc, currentBuf, scratch.attnProj, scratch.residual1, N * D);
+        dispatchLayerNorm(device, enc, scratch.residual1, lw.norm1W, lw.norm1B, { N, D, outputBuf: scratch.afterAttn });
 
-      currentBuf = layerOut;
+        // --- FFN ---
+        dispatchLinear(device, enc, scratch.afterAttn, lw.ffn1W, lw.ffn1B, {
+          numRows: N, inDim: D, outDim: FFN_DIM, outputBuf: scratch.ffnUp,
+        });
+        dispatchGELU(device, enc, scratch.ffnUp, N * FFN_DIM);
+        dispatchLinear(device, enc, scratch.ffnUp, lw.ffn2W, lw.ffn2B, {
+          numRows: N, inDim: FFN_DIM, outDim: D, outputBuf: scratch.ffnDown,
+        });
+        dispatchAdd(device, enc, scratch.afterAttn, scratch.ffnDown, scratch.residual2, N * D);
+        dispatchLayerNorm(device, enc, scratch.residual2, lw.norm2W, lw.norm2B, { N, D, outputBuf: layerOut });
+
+        currentBuf = layerOut;
+      }
+
+      if (chunkIndex === chunkCount) {
+        // Step 7-8: Extract motion portion and output projection in the final chunk.
+        const motionOutBuf = own(createEmptyBuffer(device, seqLen * D * 4));
+        enc.copyBufferToBuffer(currentBuf, prefixLen * D * 4, motionOutBuf, 0, seqLen * D * 4);
+        finalOutBuf = createEmptyBuffer(device, seqLen * outputDim * 4);
+        dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
+          numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
+        });
+      }
+
+      const commandBuffer = enc.finish();
+      if (timing) timing.encodeEndedAtMs = performance.now();
+      if (submissions) {
+        await submissions.submitDuty({ dutyId, commandBuffers: [commandBuffer] });
+      } else {
+        device.queue.submit([commandBuffer]);
+      }
+      if (timing) timing.admittedAtMs = performance.now();
+      const boundary = { dutyId, pass, chunkIndex, chunkCount, layerStart, layerEnd };
+      if (options.afterChunk) await options.afterChunk(boundary);
+      if (timing) timing.boundaryEndedAtMs = performance.now();
     }
 
-    // Step 7-8: Extract motion portion and output projection
-    const motionOutBuf = own(createEmptyBuffer(device, seqLen * D * 4));
-    enc.copyBufferToBuffer(currentBuf, prefixLen * D * 4, motionOutBuf, 0, seqLen * D * 4);
-    finalOutBuf = createEmptyBuffer(device, seqLen * outputDim * 4);
-    dispatchLinear(device, enc, motionOutBuf, weights.outputLinear.weight, weights.outputLinear.bias, {
-      numRows: seqLen, inDim: D, outDim: outputDim, outputBuf: finalOutBuf,
-    });
-
-    // The pass's single submission: one command buffer, one duty.
-    const commandBuffer = enc.finish();
-    if(options.timing)options.timing.encodeEndedAtMs=performance.now();
-    if (submissions) {
-      await submissions.submitDuty({ dutyId: options.dutyId, commandBuffers: [commandBuffer] });
-    } else {
-      device.queue.submit([commandBuffer]);
-    }
-    submitted = true;
-    if(options.timing)options.timing.admittedAtMs=performance.now();
-
+    returned = true;
     return finalOutBuf;
   } finally {
     // Exactly-once cleanup on every path. After successful submission,
@@ -219,7 +254,7 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     // completes); on a failed/rejected path the never-submitted buffers,
     // including the would-be output, are reclaimed immediately.
     for (const buf of transient) buf.destroy();
-    if (!submitted && finalOutBuf) finalOutBuf.destroy();
+    if (!returned && finalOutBuf) finalOutBuf.destroy();
   }
 }
 

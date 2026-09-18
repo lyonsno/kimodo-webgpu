@@ -8,8 +8,10 @@
  *
  * The contract now, proven against the INSTALLED kit controller:
  *
- * 1. One forward pass = ONE command encoder = ONE duty. forwardTransformer
- *    emits no host fences itself and performs no debug readback.
+ * 1. The default forward pass = ONE command encoder = ONE duty. Explicit
+ *    layersPerDuty=4 preserves all 16 layers but emits four ordered duties.
+ *    forwardTransformer emits no host fences itself and performs no debug
+ *    readback.
  * 2. Duty identity is caller-owned and unique for the generation:
  *    {prefix}-{cond|uncond}-{root|body}. A duplicate duty id must throw in
  *    the installed controller (negative case pinned).
@@ -18,7 +20,8 @@
  *    fences per step (~800 per 100-step generation), down from ~29,000 at
  *    encoder granularity. The test asserts the EXACT counts for one step
  *    against the real controller and a counting fake queue.
- * 4. drain() terminates with submitted == completed == 4 and zero failures.
+ * 4. Default drain() terminates with submitted == completed == 4 and zero
+ *    failures; one chunked pass terminates 4 == 4 with exact layer spans.
  */
 
 globalThis.GPUBufferUsage = {
@@ -117,6 +120,58 @@ const fakeWeights = () => {
     report.submittedDutyCount === 1 && report.completedDutyCount === 1
       && report.failedDutyCount === 0 && report.inFlightDutyCount === 0,
     JSON.stringify({ s: report.submittedDutyCount, c: report.completedDutyCount }));
+}
+
+// --- Explicit 4-layer chunks = four encoders, duties, and boundaries -------
+
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
+  const submissions = createWebGpuBoundedSubmissionQueue({
+    queue: device.queue, maxInFlightDuties: 2,
+  });
+  const chunks = [];
+  const out = await forwardTransformer(
+    device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null,
+    {
+      submissions,
+      dutyId: 'g1-s1-cond-root',
+      layersPerDuty: 4,
+      afterChunk: async (chunk) => chunks.push(chunk),
+    },
+  );
+  check('four-layer admission finishes exactly four command encoders',
+    counters.finished === 4, `finished=${counters.finished}`);
+  check('four-layer admission submits exactly four bounded duties',
+    counters.queueSubmits === 4, `queueSubmits=${counters.queueSubmits}`);
+  check('four-layer admission returns the final output buffer', out != null);
+  const report = await submissions.drain();
+  check('four-layer duties drain under unique chunk identities',
+    report.submittedDutyCount === 4 && report.completedDutyCount === 4
+      && report.failedDutyCount === 0
+      && report.duties.map((d) => d.dutyId).join(',')
+        === 'g1-s1-cond-root-c1,g1-s1-cond-root-c2,g1-s1-cond-root-c3,g1-s1-cond-root-c4',
+    JSON.stringify(report.duties.map((d) => d.dutyId)));
+  check('every admitted chunk reports its exact ordered layer span',
+    JSON.stringify(chunks.map(({ chunkIndex, chunkCount, layerStart, layerEnd }) => (
+      [chunkIndex, chunkCount, layerStart, layerEnd]
+    ))) === JSON.stringify([
+      [1, 4, 0, 4], [2, 4, 4, 8], [3, 4, 8, 12], [4, 4, 12, 16],
+    ]),
+    JSON.stringify(chunks));
+}
+
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
+  let error = null;
+  try {
+    await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null,
+      { dutyId: 'invalid', layersPerDuty: 8 });
+  } catch (caught) { error = caught; }
+  check('an unproved layer chunk size fails loud before encoding or submission',
+    error instanceof RangeError && counters.finished === 0 && counters.queueSubmits === 0,
+    `${error?.message} ${JSON.stringify(counters)}`);
 }
 
 {
