@@ -426,4 +426,74 @@ async function denoiseWithFailingAllocation(failAt) {
     JSON.stringify({ e: second.error?.message, live: second.liveCount }));
 }
 
+// Four model submissions may enter the shared queue before any prefix
+// completion. Only capacity at the end of that one-pass window may wait.
+// This uses the registry kit controller, not a permissive controller fake.
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
+  const resolves = [], boundaries = [], order = [];
+  device.queue.submit = buffers => { counters.queueSubmits++; order.push(buffers[0].flame ? 'flame' : 'model'); };
+  device.queue.onSubmittedWorkDone = () => {
+    counters.fences++;
+    return new Promise(resolve => resolves.push(resolve));
+  };
+  const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
+  let returned = false;
+  const pending = forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null, {
+    submissions, dutyId: 'overlap', layersPerDuty: 4,
+    afterChunk: async boundary => {
+      boundaries.push(boundary);
+      device.queue.submit([{ flame: true }]);
+    },
+  }).then(out => { returned = true; return out; });
+  await new Promise(resolve => setImmediate(resolve));
+  check('all four model chunks are submitted before any queue completion',
+    counters.finished === 4 && counters.fences === 4, JSON.stringify(counters));
+  check('three foreground turns interleave while GPU fences remain unresolved',
+    boundaries.length === 3 && order.join(',') === 'model,flame,model,flame,model,flame,model', order.join(','));
+  check('capacity stops at the one-pass window', returned === false && submissions.snapshot().maxObservedInFlightDuties === 4);
+  for (const resolve of resolves) resolve();
+  const out = await pending;
+  const report = await submissions.drain();
+  check('all sixteen layers are represented in four unique completed chunks',
+    boundaries.map(b => b.layerEnd).join(',') === '4,8,12,16'
+      && report.completedDutyCount === 4 && new Set(report.duties.map(d => d.dutyId)).size === 4);
+  check('no extra host or transformer fences are inserted', counters.fences === 4);
+  out.destroy();
+}
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
+  const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
+  const boundaries = [];
+  const stats = {
+    fps: 30, global_root_mean: [0, 0, 0, 0, 0], global_root_std: [1, 1, 1, 1, 1],
+    local_root_mean: [0, 0, 0, 0], local_root_std: [1, 1, 1, 1],
+  };
+  await denoiseStepWebGPU(device, { root: fakeWeights(), body: fakeWeights() },
+    new Float32Array(4096), Array.from({ length: 4 }, () => new Array(369).fill(0)), 500, stats,
+    { submissions, dutyPrefix: 'split-step', layersPerDuty: 4, afterPass: boundary => boundaries.push(boundary) });
+  const report = await submissions.drain();
+  check('split denoiser wires sixteen chunk opportunities with four required readbacks',
+    boundaries.length === 16 && counters.mapReadBuffers === 4 && report.completedDutyCount === 16);
+  check('split fence creation is honest: 16 kit prefixes plus 4 real readbacks, not zero',
+    counters.fences === 20, String(counters.fences));
+}
+{
+  const { device, acct } = makeAccountingDevice({});
+  const out = await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5);
+  out.destroy();
+  const liveBefore = acct.live.size;
+  let error;
+  try {
+    await forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null, {
+      dutyId: 'failed-split', layersPerDuty: 4,
+      afterChunk: boundary => { if (boundary.chunkIndex === 2) throw new Error('injected foreground failure'); },
+    });
+  } catch (e) { error = e; }
+  check('failure between chunks stops and reclaims the fixed scratch',
+    error?.message === 'injected foreground failure' && acct.live.size === liveBefore);
+}
+
 process.exit(failures ? 1 : 0);

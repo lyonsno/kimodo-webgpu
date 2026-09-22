@@ -72,9 +72,18 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   // Caller-owned duty identity: unique per generation across steps, CFG
   // roles, and submodels — the installed controller rejects duplicates for
   // its lifetime, and the first cut collided cond/uncond root passes.
-  const dutyFor = (submodel) => (options.submissions
-    ? { submissions: options.submissions, dutyId: `${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}` }
-    : {});
+  const dutyFor = (submodel) => {
+    const dutyId=`${options.dutyPrefix ?? `t${timestep}`}-${options.cfgRole ?? 'cfg'}-${submodel}`;
+    const pass=`${options.cfgRole ?? 'cfg'}-${submodel}`;
+    return {
+      submissions:options.submissions,
+      dutyId,
+      pass,
+      passTimings:options.passTimings,
+      layersPerDuty:options.layersPerDuty,
+      afterChunk:options.afterPass,
+    };
+  };
   const motionDim = 369;
 
   // --- Root model: input = [motion(369), zeros(369)] = [N, 738] ---
@@ -90,12 +99,13 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   let rootPred;
   {
     let rootOutBuf = null;
+    const duty=dutyFor('root');
+    const timingStart=options.passTimings?.length ?? 0;
     try {
-      rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, dutyFor('root'));
-      // Foreground boundary: the pass's duty is admitted; a host may place
-      // its own work (e.g. a live frame) on the shared queue here.
-      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-root` });
+      rootOutBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, timestep, N, rootInputDim, 5, null, duty);
       rootPred = await readBuffer(device, rootOutBuf, N * 5);
+      const readbackCompletedAtMs=performance.now();
+      if(options.passTimings)for(const timing of options.passTimings.slice(timingStart))timing.readbackCompletedAtMs=readbackCompletedAtMs;
     } finally {
       rootInputBuf.destroy();
       if (rootOutBuf) rootOutBuf.destroy();
@@ -123,10 +133,13 @@ async function runTwoStage(device, weights, motion, textBuf, timestep, N, stats,
   let bodyPred;
   {
     let bodyOutBuf = null;
+    const duty=dutyFor('body');
+    const timingStart=options.passTimings?.length ?? 0;
     try {
-      bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, dutyFor('body'));
-      if (options.afterPass) await options.afterPass({ pass: `${options.cfgRole ?? 'cfg'}-body` });
+      bodyOutBuf = await forwardTransformer(device, weights.body, bodyInputBuf, textBuf, timestep, N, bodyInputDim, 364, null, duty);
       bodyPred = await readBuffer(device, bodyOutBuf, N * 364);
+      const readbackCompletedAtMs=performance.now();
+      if(options.passTimings)for(const timing of options.passTimings.slice(timingStart))timing.readbackCompletedAtMs=readbackCompletedAtMs;
     } finally {
       bodyInputBuf.destroy();
       if (bodyOutBuf) bodyOutBuf.destroy();

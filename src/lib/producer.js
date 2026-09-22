@@ -243,6 +243,11 @@ export async function createKimodoProducer(input = {}) {
     const numSteps = Math.max(1, parseInt(opts.steps ?? 100, 10));
     const duration = Number(opts.duration ?? 6);
     const numFrames = Math.max(1, Math.round(duration * config.fps));
+    const layersPerDuty = opts.layersPerDuty ?? 16;
+    if (layersPerDuty !== 4 && layersPerDuty !== 16) {
+      throw new KimodoProducerError('input', 'layersPerDuty must be exactly 4 or 16');
+    }
+    const chunksPerPass = 16 / layersPerDuty;
     const generationId = opts.generationId ?? ++generationCounter;
     const signal = opts.signal ?? null;
     // The effective endpoint is recorded on the receipt; a per-generation
@@ -309,6 +314,11 @@ export async function createKimodoProducer(input = {}) {
     };
 
     let gpuSubmissionSummary = null;
+    // Page-clock observations, not isolated GPU execution timestamps.
+    const diagnostics = {
+      clock: 'performance.now', timeOrigin: performance.timeOrigin,
+      scheduling: { layersPerDuty, chunksPerPass }, passes: [], submissionReport: null,
+    };
     let motion;
     let submissions = null;
     try { // whole-operation scope: the abort bridge lives until this returns or throws
@@ -342,12 +352,14 @@ export async function createKimodoProducer(input = {}) {
             {
               submissions,
               dutyPrefix: `g${generationId}-s${n}`,
+              passTimings: diagnostics.passes,
+              layersPerDuty,
               // Foreground-opportunity boundary between admitted duties: the
               // host may submit its own work on the shared queue here.
               afterPass: opts.foregroundOpportunity
-                ? ({ pass }) => raceAbort(opts.foregroundOpportunity({
+                ? (chunk) => raceAbort(opts.foregroundOpportunity({
                   submit: hostSubmit, signal: gpuAbort.signal,
-                  phase: 'ddim-sampling', step: n, numSteps, pass,
+                  phase: 'ddim-sampling', step: n, numSteps, ...chunk,
                 }))
                 : undefined,
             },
@@ -365,6 +377,7 @@ export async function createKimodoProducer(input = {}) {
         }
         boundaryOpen = false;
         const report = await submissions.drain();
+        diagnostics.submissionReport = report;
         gpuSubmissionSummary = { ...summarizeSubmissionReport(report), hostSubmissionCount: hostFences.length };
       } catch (err) {
         // Stop admission, revoke the host's submit, settle accepted producer
@@ -373,8 +386,13 @@ export async function createKimodoProducer(input = {}) {
         boundaryOpen = false;
         gpuAbort.abort();
         if (submissions) {
-          try { gpuSubmissionSummary = summarizeSubmissionReport(await submissions.drain()); }
-          catch (drainErr) { gpuSubmissionSummary = summarizeSubmissionReport(drainErr?.boundedGpuSubmissionReport ?? null, drainErr); }
+          try {
+            diagnostics.submissionReport = await submissions.drain();
+            gpuSubmissionSummary = summarizeSubmissionReport(diagnostics.submissionReport);
+          } catch (drainErr) {
+            diagnostics.submissionReport = drainErr?.boundedGpuSubmissionReport ?? null;
+            gpuSubmissionSummary = summarizeSubmissionReport(diagnostics.submissionReport, drainErr);
+          }
         }
         await Promise.allSettled(hostFences);
         if (gpuSubmissionSummary) gpuSubmissionSummary.hostSubmissionCount = hostFences.length;
@@ -433,8 +451,10 @@ export async function createKimodoProducer(input = {}) {
           numJoints: decoded.num_joints,
         },
         submission: gpuSubmissionSummary,
+        diagnostics,
       };
     } catch (err) {
+      err.diagnostics = diagnostics;
       if (err instanceof KimodoProducerError && err.gpuSubmission === undefined) err.gpuSubmission = gpuSubmissionSummary;
       throw err;
     } finally {

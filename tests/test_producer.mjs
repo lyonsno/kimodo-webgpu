@@ -597,4 +597,20 @@ for (const [mode, expectPhase, label] of [
     JSON.stringify({ phase: error?.phase ?? null, name: error?.name, m: error?.message, cause: error?.cause?.message ?? null }));
 }
 
+{
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const boundaries = [];
+  const result = await producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, layersPerDuty: 4, maxInFlightDuties: 4,
+    foregroundOpportunity: b => boundaries.push(b),
+  });
+  check('producer explicitly preserves split identity and emits sixteen real duties',
+    result.submission.submittedDutyCount === 16 && boundaries.length === 16
+      && result.diagnostics?.scheduling.layersPerDuty === 4);
+  let error;
+  try { await producer.generate({ prompt: 'x', steps: 1, layersPerDuty: 3 }); } catch (e) { error = e; }
+  check('producer rejects an unsupported schedule rather than silently using full passes', error?.phase === 'input');
+  producer.dispose();
+}
 process.exit(failures ? 1 : 0);

@@ -75,6 +75,21 @@ async function main() {
     console.log('[num-compare] Running WebGPU forward pass...');
     const outBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, 500, N, 738, 5);
     const output = await readBuffer(device, outBuf, N * 5);
+    const { createWebGpuBoundedSubmissionQueue } = await import('/node_modules/@kaminos/webgpu-inference-kit/src/index.js');
+    const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
+    const boundaries = [];
+    const splitBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, 500, N, 738, 5, null, {
+      submissions, dutyId: 'native-parity', layersPerDuty: 4,
+      afterChunk: boundary => boundaries.push(boundary),
+    });
+    const splitOutput = await readBuffer(device, splitBuf, N * 5);
+    const splitReport = await submissions.drain();
+    const splitMaxDiff = Math.max(...output.map((value, i) => Math.abs(value - splitOutput[i])));
+    const splitPass = splitMaxDiff === 0 && boundaries.length === 4 && splitReport.completedDutyCount === 4;
+    console.log('[num-compare] Split/full output: ' + JSON.stringify({
+      splitMaxDiff, splitPass, full: Array.from(output), split: Array.from(splitOutput), splitReport,
+    }));
+    splitBuf.destroy();
 
     rootInputBuf.destroy();
     textBuf.destroy();
@@ -105,7 +120,8 @@ async function main() {
     console.log(`[num-compare] Max absolute diff: ${maxDiff.toFixed(6)}`);
     console.log(`[num-compare] Overall: ${maxDiff < 0.01 ? 'PASS (< 0.01)' : maxDiff < 0.1 ? 'WARN (< 0.1)' : 'FAIL (>= 0.1)'}`);
 
-    return { comparison, maxDiff, pass: maxDiff < 0.01 };
+    device.destroy();
+    return { comparison, maxDiff, splitMaxDiff, splitPass, pass: maxDiff < 0.01 && splitPass };
   }, ref);
 
   console.log('\n[num-compare] === RESULT ===');

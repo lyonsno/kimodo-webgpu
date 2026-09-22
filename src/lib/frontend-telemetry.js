@@ -92,6 +92,7 @@ export function createFrontendTelemetry({
   generationId,
   numSteps,
   requestedMaxInFlightDuties,
+  boundariesPerStep = 4,
   now = () => globalThis.performance?.now?.() ?? Date.now(),
 } = {}) {
   if (!Number.isSafeInteger(generationId) || generationId <= 0) {
@@ -102,6 +103,9 @@ export function createFrontendTelemetry({
   }
   if (!Number.isSafeInteger(requestedMaxInFlightDuties) || requestedMaxInFlightDuties <= 0) {
     throw new TypeError('requestedMaxInFlightDuties must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(boundariesPerStep) || boundariesPerStep <= 0) {
+    throw new TypeError('boundariesPerStep must be a positive safe integer');
   }
 
   const startedAtMs = now();
@@ -120,7 +124,8 @@ export function createFrontendTelemetry({
     scheduler: {
       mode: 'cooperative-foreground-boundary',
       requestedMaxInFlightDuties,
-      expectedForegroundBoundaryCount: numSteps * 4,
+      boundariesPerStep,
+      expectedForegroundBoundaryCount: numSteps * boundariesPerStep,
       observedForegroundBoundaryCount: 0,
       lastBoundary: null,
       hostSubmissionCount: 0,
@@ -151,6 +156,11 @@ export function createFrontendTelemetry({
         step: boundary.step ?? null,
         numSteps: boundary.numSteps ?? numSteps,
         pass: boundary.pass ?? null,
+        dutyId: boundary.dutyId ?? null,
+        chunkIndex: boundary.chunkIndex ?? null,
+        chunkCount: boundary.chunkCount ?? null,
+        layerStart: boundary.layerStart ?? null,
+        layerEnd: boundary.layerEnd ?? null,
       };
       updateElapsed();
     },
@@ -199,7 +209,7 @@ export function createFrontendTelemetry({
         };
       } else {
         problem = terminalSubmissionProblem(receiptSubmission, {
-          expectedProducerDutyCount: numSteps * 4,
+          expectedProducerDutyCount: numSteps * boundariesPerStep,
           requestedMaxInFlightDuties,
         });
         if (!problem && auxiliarySubmission !== undefined
