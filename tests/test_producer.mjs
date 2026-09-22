@@ -270,6 +270,73 @@ function makeSignalSpy() {
 }
 
 {
+  // A host-owned CPU foreground window has lifecycle custody beyond the
+  // caller-facing abort race. Cancellation must not let generation finish
+  // until the admitted window itself settles.
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const abort = new AbortController();
+  let enteredWindow;
+  let releaseWindow;
+  const windowEntered = new Promise(resolve => { enteredWindow = resolve; });
+  const windowRelease = new Promise(resolve => { releaseWindow = resolve; });
+  const pending = producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, signal: abort.signal,
+    foregroundWindow: async (phase, work) => {
+      if (phase !== 'text-embedding') return work();
+      enteredWindow();
+      try { return await work(); }
+      finally { await windowRelease; }
+    },
+  });
+  await windowEntered;
+  abort.abort();
+  const beforeRelease = await Promise.race([
+    pending.then(() => 'settled', () => 'settled'),
+    new Promise(resolve => setTimeout(() => resolve('pending'), 30)),
+  ]);
+  releaseWindow();
+  let error = null;
+  try { await pending; } catch (err) { error = err; }
+  check('abort during text embedding preserves host foreground-window custody until settlement',
+    beforeRelease === 'pending' && error?.phase === 'cancelled',
+    JSON.stringify({ beforeRelease, phase: error?.phase }));
+}
+
+{
+  const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
+  const { producer } = await makeProducer(counters);
+  const abort = new AbortController();
+  let enteredWindow;
+  let releaseWindow;
+  const windowEntered = new Promise(resolve => { enteredWindow = resolve; });
+  const windowRelease = new Promise(resolve => { releaseWindow = resolve; });
+  const pending = producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, signal: abort.signal,
+    foregroundWindow: async (phase, work) => {
+      const value = await work();
+      if (phase === 'fk-decode') {
+        enteredWindow();
+        await windowRelease;
+      }
+      return value;
+    },
+  });
+  await windowEntered;
+  abort.abort();
+  const beforeRelease = await Promise.race([
+    pending.then(() => 'settled', () => 'settled'),
+    new Promise(resolve => setTimeout(() => resolve('pending'), 30)),
+  ]);
+  releaseWindow();
+  let error = null;
+  try { await pending; } catch (err) { error = err; }
+  check('abort during FK decode preserves host foreground-window custody until settlement',
+    beforeRelease === 'pending' && error?.phase === 'cancelled',
+    JSON.stringify({ beforeRelease, phase: error?.phase }));
+}
+
+{
   // Abort while the foreground callback never resolves: the call settles and
   // the retained submit capability is revoked.
   const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };

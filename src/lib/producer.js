@@ -282,9 +282,18 @@ export async function createKimodoProducer(input = {}) {
         Promise.resolve(promise).then((v) => settle(resolve, v), (e) => settle(reject, e));
       });
     };
-    const withForeground = (phase, work) => opts.foregroundWindow
-      ? raceAbort(Promise.resolve().then(() => opts.foregroundWindow(phase, work)))
-      : raceAbort(Promise.resolve().then(work));
+    const withForeground = async (phase, work) => {
+      // A host foreground window owns ordering on the shared device. Abort may
+      // cancel the work inside that scope, but it must not let the producer
+      // return before the host has closed the window and released that
+      // ordering custody. Without a host window, keep the ordinary caller-side
+      // abort race for backwards-compatible standalone use.
+      const value = opts.foregroundWindow
+        ? await Promise.resolve().then(() => opts.foregroundWindow(phase, work))
+        : await raceAbort(Promise.resolve().then(work));
+      checkCancelled();
+      return value;
+    };
 
     // Host submissions through the boundary are tracked (queue-prefix fence
     // captured per submit) and revocable: after the generation ends — success
