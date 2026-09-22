@@ -176,12 +176,14 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
       const dutyId = chunkCount === 1 ? options.dutyId : `${options.dutyId}-c${chunkIndex}`;
       const pass = options.pass ?? options.timing?.pass ?? null;
       const timing = options.passTimings
-        ? { dutyId, pass, chunkIndex, chunkCount, layerStart, layerEnd }
+        ? { dutyId, pass, step: options.step, numSteps: options.numSteps, chunkIndex, chunkCount, layerStart, layerEnd }
         : (chunkCount === 1 ? options.timing ?? null : null);
       if (options.passTimings) options.passTimings.push(timing); // partial rows survive failure
       if (timing) {
         timing.dutyId = dutyId;
         timing.pass = pass;
+        timing.step = options.step;
+        timing.numSteps = options.numSteps;
         timing.chunkIndex = chunkIndex;
         timing.chunkCount = chunkCount;
         timing.layerStart = layerStart;
@@ -241,7 +243,10 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
         device.queue.submit([commandBuffer]);
       }
       if (timing) timing.admittedAtMs = performance.now();
-      const boundary = { dutyId, pass, chunkIndex, chunkCount, layerStart, layerEnd };
+      const boundary = {
+        dutyId, pass, step: options.step, numSteps: options.numSteps,
+        chunkIndex, chunkCount, layerStart, layerEnd,
+      };
       if (options.afterChunk) await options.afterChunk(boundary);
       if (timing) timing.boundaryEndedAtMs = performance.now();
     }

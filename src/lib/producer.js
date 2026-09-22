@@ -248,6 +248,15 @@ export async function createKimodoProducer(input = {}) {
       throw new KimodoProducerError('input', 'layersPerDuty must be exactly 4 or 16');
     }
     const chunksPerPass = 16 / layersPerDuty;
+    const maxInFlightDuties = opts.maxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES;
+    const scheduleMode = opts.scheduleMode ?? null;
+    if (scheduleMode !== null && !['full-pass', 'fence-light'].includes(scheduleMode)) {
+      throw new KimodoProducerError('input', 'scheduleMode must be full-pass or fence-light');
+    }
+    if (scheduleMode === 'full-pass' && (layersPerDuty !== 16 || maxInFlightDuties !== 2)
+      || scheduleMode === 'fence-light' && (layersPerDuty !== 4 || maxInFlightDuties !== 4)) {
+      throw new KimodoProducerError('input', `scheduleMode ${scheduleMode} conflicts with the effective submission schedule`);
+    }
     const generationId = opts.generationId ?? ++generationCounter;
     const signal = opts.signal ?? null;
     // The effective endpoint is recorded on the receipt; a per-generation
@@ -317,7 +326,11 @@ export async function createKimodoProducer(input = {}) {
     // Page-clock observations, not isolated GPU execution timestamps.
     const diagnostics = {
       clock: 'performance.now', timeOrigin: performance.timeOrigin,
-      scheduling: { layersPerDuty, chunksPerPass }, passes: [], submissionReport: null,
+      generationId,
+      numSteps,
+      scheduleMode,
+      scheduling: { mode: scheduleMode, layersPerDuty, chunksPerPass, maxInFlightDuties },
+      passes: [], submissionReport: null,
     };
     let motion;
     let submissions = null;
@@ -337,7 +350,7 @@ export async function createKimodoProducer(input = {}) {
         profile.start('ddim-sampling');
         submissions = createWebGpuBoundedSubmissionQueue({
           queue,
-          maxInFlightDuties: opts.maxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES,
+          maxInFlightDuties,
           signal: gpuAbort.signal,
         });
         boundaryOpen = true;
@@ -352,6 +365,8 @@ export async function createKimodoProducer(input = {}) {
             {
               submissions,
               dutyPrefix: `g${generationId}-s${n}`,
+              step: n,
+              numSteps,
               passTimings: diagnostics.passes,
               layersPerDuty,
               // Foreground-opportunity boundary between admitted duties: the

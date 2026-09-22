@@ -602,15 +602,32 @@ for (const [mode, expectPhase, label] of [
   const { producer } = await makeProducer(counters);
   const boundaries = [];
   const result = await producer.generate({
-    prompt: 'x', steps: 1, duration: 0.1, layersPerDuty: 4, maxInFlightDuties: 4,
+    prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'fence-light', layersPerDuty: 4, maxInFlightDuties: 4,
     foregroundOpportunity: b => boundaries.push(b),
   });
   check('producer explicitly preserves split identity and emits sixteen real duties',
     result.submission.submittedDutyCount === 16 && boundaries.length === 16
-      && result.diagnostics?.scheduling.layersPerDuty === 4);
+      && result.diagnostics?.generationId === result.motion.generationId
+      && result.diagnostics?.numSteps === 1
+      && result.diagnostics?.scheduleMode === 'fence-light'
+      && result.diagnostics?.scheduling.mode === 'fence-light'
+      && result.diagnostics?.scheduling.maxInFlightDuties === 4
+      && result.diagnostics?.passes.every((row, i) => row.step === 1 && row.numSteps === 1
+        && boundaries[i].step === 1 && boundaries[i].numSteps === 1));
+  const fullPass = await producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'full-pass', layersPerDuty: 16, maxInFlightDuties: 2,
+  });
+  check('full-pass keeps a distinct declared identity and the original four-duty schedule',
+    fullPass.diagnostics?.scheduleMode === 'full-pass'
+      && fullPass.diagnostics?.scheduling.mode === 'full-pass'
+      && fullPass.diagnostics?.passes.length === 4
+      && fullPass.diagnostics?.scheduling.maxInFlightDuties === 2);
   let error;
   try { await producer.generate({ prompt: 'x', steps: 1, layersPerDuty: 3 }); } catch (e) { error = e; }
   check('producer rejects an unsupported schedule rather than silently using full passes', error?.phase === 'input');
+  error = null;
+  try { await producer.generate({ prompt: 'x', steps: 1, scheduleMode: 'fence-light', layersPerDuty: 4, maxInFlightDuties: 2 }); } catch (e) { error = e; }
+  check('producer rejects a schedule label that conflicts with its effective capacity', error?.phase === 'input');
   producer.dispose();
 }
 process.exit(failures ? 1 : 0);
