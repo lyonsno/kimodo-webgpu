@@ -105,9 +105,12 @@ async function makeProducer(counters, extra = {}) {
 
 {
   const counters = { queueSubmits: 0, destroyed: 0, deviceDestroyed: 0 };
-  const { producer } = await makeProducer(counters);
+  const { device, producer } = await makeProducer(counters);
   check('producer initializes on a borrowed device without touching navigator.gpu',
     typeof globalThis.navigator === 'undefined' || !globalThis.navigator?.gpu, 'test runs without navigator.gpu at all');
+  check('producer exposes the exact borrowed device for host composition verification',
+    producer.device === device && producer.deviceInjected === true,
+    `device=${producer.device === device} injected=${producer.deviceInjected}`);
   check('producer exposes resolved identity (model, kit version, embed endpoint, config fps)',
     producer.identity?.model?.id === 'NVIDIA/Kimodo-SOMA-RP-v1.1'
       && typeof producer.identity?.kitVersion === 'string'
@@ -129,12 +132,17 @@ async function makeProducer(counters, extra = {}) {
   const stages = [];
   const progress = [];
   const boundaries = [];
+  const foregroundWindows = [];
   const result = await producer.generate({
     prompt: 'a person walks forward',
     steps: 3,
     duration: 0.1, // 3 frames at 30fps
     onStage: (name, event) => stages.push(`${name}:${event}`),
     onProgress: (p) => progress.push(p),
+    foregroundWindow: async (phase, work) => {
+      foregroundWindows.push(phase);
+      return work();
+    },
     foregroundOpportunity: async (b) => {
       boundaries.push({ phase: b.phase, step: b.step, pass: b.pass, hasSubmit: typeof b.submit === 'function', hasSignal: !!b.signal });
       b.submit([{}]); // host advances its flame on the shared queue
@@ -146,6 +154,9 @@ async function makeProducer(counters, extra = {}) {
   check('the four stage boundaries are preserved in order',
     stages.join(',') === 'text-embedding:start,text-embedding:end,ddim-sampling:start,ddim-sampling:end,fk-decode:start,fk-decode:end,output-capture:start,output-capture:end',
     stages.join(','));
+  check('host foreground windows cover the text wait and CPU decode stages',
+    foregroundWindows.join(',') === 'text-embedding,fk-decode',
+    foregroundWindows.join(','));
   check('progress is reported per step with a denominator',
     progress.length === 3 && progress.every((p) => p.numSteps === 3) && progress.at(-1).step === 3,
     JSON.stringify(progress));

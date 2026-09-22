@@ -65,7 +65,7 @@ Browser (this repo)                        Server (you supply)
 └─────────────────────────────────┘
 ```
 
-Runtime plumbing comes from [`@kaminos/webgpu-inference-kit`](https://www.npmjs.com/package/@kaminos/webgpu-inference-kit) (pinned `^0.1.49`): the bounded submission queue that paces the diffusion loop, backend-identity capture and validation, and the Kimodo route definition/receipt factories that stamp every generation with a validated receipt. The kernels themselves stay local.
+Runtime plumbing comes from [`@kaminos/webgpu-inference-kit`](https://www.npmjs.com/package/@kaminos/webgpu-inference-kit) (pinned `^0.1.52`): the bounded submission queue that paces the diffusion loop, backend-identity capture and validation, and the Kimodo route definition/receipt factories that stamp every generation with a validated receipt. The kernels themselves stay local.
 
 **WGSL compute shaders** (kernel layer shared with [moge-webgpu](https://github.com/lyonsno/moge-webgpu)):
 

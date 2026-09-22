@@ -282,6 +282,9 @@ export async function createKimodoProducer(input = {}) {
         Promise.resolve(promise).then((v) => settle(resolve, v), (e) => settle(reject, e));
       });
     };
+    const withForeground = (phase, work) => opts.foregroundWindow
+      ? raceAbort(Promise.resolve().then(() => opts.foregroundWindow(phase, work)))
+      : raceAbort(Promise.resolve().then(work));
 
     // Host submissions through the boundary are tracked (queue-prefix fence
     // captured per submit) and revocable: after the generation ends — success
@@ -303,7 +306,10 @@ export async function createKimodoProducer(input = {}) {
       try {
         stage('text-embedding', 'start');
         profile.start('text-embedding');
-        const textEmbedding = await fetchEmbedding(prompt, embedUrl, signal);
+        const textEmbedding = await withForeground(
+          'text-embedding',
+          () => fetchEmbedding(prompt, embedUrl, signal),
+        );
         profile.end();
         stage('text-embedding', 'end');
         checkCancelled();
@@ -376,7 +382,7 @@ export async function createKimodoProducer(input = {}) {
       stage('fk-decode', 'start');
       checkCancelled();
       profile.start('fk-decode');
-      const decoded = decodeMotion(motion);
+      const decoded = await withForeground('fk-decode', () => decodeMotion(motion));
       profile.end();
       stage('fk-decode', 'end');
       checkCancelled();
@@ -436,5 +442,9 @@ export async function createKimodoProducer(input = {}) {
     if (ownsWeights) destroyOwned(weights);
   }
 
-  return { identity, generate, dispose };
+  // The producer never owns or destroys this device. Exposing the exact
+  // borrowed object lets a composing host prove that inference and its live
+  // renderer are using one GPUDevice/queue instead of trusting construction
+  // arguments or a same-adapter guess.
+  return { identity, device, deviceInjected: true, generate, dispose };
 }
