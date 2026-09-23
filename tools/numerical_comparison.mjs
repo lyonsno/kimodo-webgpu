@@ -129,7 +129,7 @@ async function main() {
     console.log(`[num-compare] Overall: ${maxDiff < 0.01 ? 'PASS (< 0.01)' : maxDiff < 0.1 ? 'WARN (< 0.1)' : 'FAIL (>= 0.1)'}`);
 
     device.destroy();
-    return { comparison, maxDiff, splitLayersPerDuty, splitMaxDiff, splitPass, pass: maxDiff < 0.01 && splitPass };
+    return { comparison, maxDiff, splitLayersPerDuty: layersPerDuty, splitMaxDiff, splitPass, pass: maxDiff < 0.01 && splitPass };
   }, { refData: ref, layersPerDuty: splitLayersPerDuty });
 
   console.log('\n[num-compare] === RESULT ===');
