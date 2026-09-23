@@ -465,6 +465,44 @@ async function denoiseWithFailingAllocation(failAt) {
 {
   const counters = makeCounters();
   const device = makeFakeDevice(counters);
+  const resolves = [], boundaries = [], order = [];
+  device.queue.submit = buffers => { counters.queueSubmits++; order.push(buffers[0].flame ? 'flame' : 'model'); };
+  device.queue.onSubmittedWorkDone = () => {
+    counters.fences++;
+    return new Promise(resolve => resolves.push(resolve));
+  };
+  const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
+  let settled = false;
+  const pending = forwardTransformer(device, fakeWeights(), anyBuffer(), anyBuffer(), 500, 8, 738, 5, null, {
+    submissions, dutyId: 'single-layer-pass', layersPerDuty: 1,
+    afterChunk: async boundary => {
+      boundaries.push(boundary);
+      device.queue.submit([{ flame: true }]);
+    },
+  }).then(out => { settled = true; return out; }, error => { settled = true; throw error; });
+  while (!settled) {
+    await new Promise(resolve => setImmediate(resolve));
+    for (const resolve of resolves.splice(0)) resolve();
+  }
+  const out = await pending;
+  const report = await submissions.drain();
+  check('single-layer duties expose all sixteen ordered boundaries while flame submits between them',
+    boundaries.length === 16
+      && boundaries.map(b => `${b.layerStart}-${b.layerEnd}`).join(',')
+        === Array.from({ length: 16 }, (_, i) => `${i}-${i + 1}`).join(',')
+      && order.join(',') === Array.from({ length: 16 }, () => 'model,flame').join(','),
+    JSON.stringify({ boundaries: boundaries.length, order: order.join(',') }));
+  check('single-layer submission remains bounded to four in flight and drains sixteen distinct duties',
+    report.status === 'drained' && report.maxInFlightDuties === 4
+      && report.maxObservedInFlightDuties <= 4
+      && report.submittedDutyCount === 16 && report.completedDutyCount === 16
+      && new Set(report.duties.map(duty => duty.dutyId)).size === 16);
+  check('single-layer path adds exactly one real prefix fence per submitted layer duty', counters.fences === 16, String(counters.fences));
+  out.destroy();
+}
+{
+  const counters = makeCounters();
+  const device = makeFakeDevice(counters);
   const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
   const boundaries = [];
   const stats = {

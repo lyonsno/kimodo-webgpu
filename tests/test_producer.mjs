@@ -614,6 +614,22 @@ for (const [mode, expectPhase, label] of [
       && result.diagnostics?.scheduling.maxInFlightDuties === 4
       && result.diagnostics?.passes.every((row, i) => row.step === 1 && row.numSteps === 1
         && boundaries[i].step === 1 && boundaries[i].numSteps === 1));
+  const singleLayerBoundaries = [];
+  const singleLayer = await producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'single-layer', layersPerDuty: 1, maxInFlightDuties: 4,
+    foregroundOpportunity: b => singleLayerBoundaries.push(b),
+  });
+  check('opt-in single-layer schedule preserves every layer in sixty-four ordered duties',
+    singleLayer.submission.submittedDutyCount === 64 && singleLayerBoundaries.length === 64
+      && singleLayer.diagnostics?.scheduleMode === 'single-layer'
+      && singleLayer.diagnostics?.scheduling.mode === 'single-layer'
+      && singleLayer.diagnostics?.scheduling.layersPerDuty === 1
+      && singleLayer.diagnostics?.scheduling.chunksPerPass === 16
+      && singleLayer.diagnostics?.scheduling.maxInFlightDuties === 4
+      && singleLayer.diagnostics?.passes.every((row, i) => row.layerEnd - row.layerStart === 1
+        && row.chunkIndex === (i % 16) + 1 && row.chunkCount === 16
+        && singleLayerBoundaries[i].layerStart === row.layerStart
+        && singleLayerBoundaries[i].layerEnd === row.layerEnd));
   const fullPass = await producer.generate({
     prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'full-pass', layersPerDuty: 16, maxInFlightDuties: 2,
   });

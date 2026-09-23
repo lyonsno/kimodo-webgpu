@@ -78,8 +78,8 @@ export async function forwardTransformer(device, weights, motionBuf, textBuf, ti
     throw new Error('a bounded submissions context requires a caller-owned unique dutyId');
   }
   const layersPerDuty = options.layersPerDuty ?? 16;
-  if (layersPerDuty !== 4 && layersPerDuty !== 16) {
-    throw new RangeError('layersPerDuty must be exactly 4 or 16');
+  if (layersPerDuty !== 1 && layersPerDuty !== 4 && layersPerDuty !== 16) {
+    throw new RangeError('layersPerDuty must be exactly 1, 4, or 16');
   }
   const chunkCount = 16 / layersPerDuty;
   if (chunkCount > 1 && !options.dutyId) {

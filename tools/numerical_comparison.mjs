@@ -14,6 +14,11 @@ import { readFileSync } from 'fs';
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const args = process.argv.slice(2);
 const url = args.find((a, i) => args[i-1] === '--url') || 'http://localhost:5176';
+const layersArgIndex = args.indexOf('--layers-per-duty');
+const splitLayersPerDuty = layersArgIndex < 0 ? 4 : Number(args[layersArgIndex + 1]);
+if (![1, 4, 16].includes(splitLayersPerDuty)) {
+  throw new Error('--layers-per-duty must be exactly 1, 4, or 16');
+}
 
 const ref = JSON.parse(readFileSync(new URL('../tests/pytorch_reference.json', import.meta.url)));
 
@@ -38,7 +43,7 @@ async function main() {
   console.log('[num-compare] Weights loaded. Running comparison...');
 
   // Pass the full reference data to the browser and run the comparison there
-  const results = await page.evaluate(async (refData) => {
+  const results = await page.evaluate(async ({ refData, layersPerDuty }) => {
     const { createStorageBuffer, createEmptyBuffer } = await import('/src/lib/gpu.js');
     const { forwardTransformer, readBuffer } = await import('/src/lib/inference.js');
     const { loadWeights } = await import('/src/lib/weights.js');
@@ -79,15 +84,18 @@ async function main() {
     const submissions = createWebGpuBoundedSubmissionQueue({ queue: device.queue, maxInFlightDuties: 4 });
     const boundaries = [];
     const splitBuf = await forwardTransformer(device, weights.root, rootInputBuf, textBuf, 500, N, 738, 5, null, {
-      submissions, dutyId: 'native-parity', layersPerDuty: 4,
+      submissions, dutyId: 'native-parity', layersPerDuty,
       afterChunk: boundary => boundaries.push(boundary),
     });
     const splitOutput = await readBuffer(device, splitBuf, N * 5);
     const splitReport = await submissions.drain();
     const splitMaxDiff = Math.max(...output.map((value, i) => Math.abs(value - splitOutput[i])));
-    const splitPass = splitMaxDiff === 0 && boundaries.length === 4 && splitReport.completedDutyCount === 4;
+    const expectedChunks = 16 / layersPerDuty;
+    const splitPass = splitMaxDiff === 0 && boundaries.length === expectedChunks
+      && splitReport.completedDutyCount === expectedChunks;
     console.log('[num-compare] Split/full output: ' + JSON.stringify({
-      splitMaxDiff, splitPass, full: Array.from(output), split: Array.from(splitOutput), splitReport,
+      splitLayersPerDuty: layersPerDuty, expectedChunks, splitMaxDiff, splitPass,
+      full: Array.from(output), split: Array.from(splitOutput), splitReport,
     }));
     splitBuf.destroy();
 
@@ -121,11 +129,12 @@ async function main() {
     console.log(`[num-compare] Overall: ${maxDiff < 0.01 ? 'PASS (< 0.01)' : maxDiff < 0.1 ? 'WARN (< 0.1)' : 'FAIL (>= 0.1)'}`);
 
     device.destroy();
-    return { comparison, maxDiff, splitMaxDiff, splitPass, pass: maxDiff < 0.01 && splitPass };
-  }, ref);
+    return { comparison, maxDiff, splitLayersPerDuty, splitMaxDiff, splitPass, pass: maxDiff < 0.01 && splitPass };
+  }, { refData: ref, layersPerDuty: splitLayersPerDuty });
 
   console.log('\n[num-compare] === RESULT ===');
   console.log(`  Max diff: ${results.maxDiff?.toFixed(6) || 'N/A'}`);
+  console.log(`  Split layers per duty: ${results.splitLayersPerDuty ?? 'N/A'}`);
   console.log(`  Status: ${results.pass ? 'PASS' : results.error ? `ERROR: ${results.error}` : 'FAIL'}`);
 
   if (results.comparison) {

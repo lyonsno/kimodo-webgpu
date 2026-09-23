@@ -244,17 +244,18 @@ export async function createKimodoProducer(input = {}) {
     const duration = Number(opts.duration ?? 6);
     const numFrames = Math.max(1, Math.round(duration * config.fps));
     const layersPerDuty = opts.layersPerDuty ?? 16;
-    if (layersPerDuty !== 4 && layersPerDuty !== 16) {
-      throw new KimodoProducerError('input', 'layersPerDuty must be exactly 4 or 16');
+    if (layersPerDuty !== 1 && layersPerDuty !== 4 && layersPerDuty !== 16) {
+      throw new KimodoProducerError('input', 'layersPerDuty must be exactly 1, 4, or 16');
     }
     const chunksPerPass = 16 / layersPerDuty;
     const maxInFlightDuties = opts.maxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES;
     const scheduleMode = opts.scheduleMode ?? null;
-    if (scheduleMode !== null && !['full-pass', 'fence-light'].includes(scheduleMode)) {
-      throw new KimodoProducerError('input', 'scheduleMode must be full-pass or fence-light');
+    if (scheduleMode !== null && !['full-pass', 'fence-light', 'single-layer'].includes(scheduleMode)) {
+      throw new KimodoProducerError('input', 'scheduleMode must be full-pass, fence-light, or single-layer');
     }
     if (scheduleMode === 'full-pass' && (layersPerDuty !== 16 || maxInFlightDuties !== 2)
-      || scheduleMode === 'fence-light' && (layersPerDuty !== 4 || maxInFlightDuties !== 4)) {
+      || scheduleMode === 'fence-light' && (layersPerDuty !== 4 || maxInFlightDuties !== 4)
+      || scheduleMode === 'single-layer' && (layersPerDuty !== 1 || maxInFlightDuties !== 4)) {
       throw new KimodoProducerError('input', `scheduleMode ${scheduleMode} conflicts with the effective submission schedule`);
     }
     const generationId = opts.generationId ?? ++generationCounter;
