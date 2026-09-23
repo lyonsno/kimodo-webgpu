@@ -630,6 +630,24 @@ for (const [mode, expectPhase, label] of [
         && row.chunkIndex === (i % 16) + 1 && row.chunkCount === 16
         && singleLayerBoundaries[i].layerStart === row.layerStart
         && singleLayerBoundaries[i].layerEnd === row.layerEnd));
+  const singleLayerSerialBoundaries = [];
+  const singleLayerSerial = await producer.generate({
+    prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'single-layer-serial', layersPerDuty: 1, maxInFlightDuties: 1,
+    foregroundOpportunity: b => singleLayerSerialBoundaries.push(b),
+  });
+  check('serial single-layer schedule preserves all duties while allowing only one outstanding GPU duty',
+    singleLayerSerial.submission.submittedDutyCount === 64 && singleLayerSerialBoundaries.length === 64
+      && singleLayerSerial.diagnostics?.scheduleMode === 'single-layer-serial'
+      && singleLayerSerial.diagnostics?.scheduling.mode === 'single-layer-serial'
+      && singleLayerSerial.diagnostics?.scheduling.layersPerDuty === 1
+      && singleLayerSerial.diagnostics?.scheduling.chunksPerPass === 16
+      && singleLayerSerial.submission.maxInFlightDuties === 1
+      && singleLayerSerial.submission.maxObservedInFlightDuties === 1
+      && singleLayerSerial.submission.status === 'drained'
+      && singleLayerSerial.diagnostics?.scheduling.maxInFlightDuties === 1
+      && singleLayerSerial.diagnostics?.passes.every((row, i) => row.layerEnd - row.layerStart === 1
+        && singleLayerSerialBoundaries[i].layerStart === row.layerStart
+        && singleLayerSerialBoundaries[i].layerEnd === row.layerEnd));
   const fullPass = await producer.generate({
     prompt: 'x', steps: 1, duration: 0.1, scheduleMode: 'full-pass', layersPerDuty: 16, maxInFlightDuties: 2,
   });

@@ -250,12 +250,13 @@ export async function createKimodoProducer(input = {}) {
     const chunksPerPass = 16 / layersPerDuty;
     const maxInFlightDuties = opts.maxInFlightDuties ?? KIMODO_DEFAULT_MAX_IN_FLIGHT_DUTIES;
     const scheduleMode = opts.scheduleMode ?? null;
-    if (scheduleMode !== null && !['full-pass', 'fence-light', 'single-layer'].includes(scheduleMode)) {
-      throw new KimodoProducerError('input', 'scheduleMode must be full-pass, fence-light, or single-layer');
+    if (scheduleMode !== null && !['full-pass', 'fence-light', 'single-layer', 'single-layer-serial'].includes(scheduleMode)) {
+      throw new KimodoProducerError('input', 'scheduleMode must be full-pass, fence-light, single-layer, or single-layer-serial');
     }
     if (scheduleMode === 'full-pass' && (layersPerDuty !== 16 || maxInFlightDuties !== 2)
       || scheduleMode === 'fence-light' && (layersPerDuty !== 4 || maxInFlightDuties !== 4)
-      || scheduleMode === 'single-layer' && (layersPerDuty !== 1 || maxInFlightDuties !== 4)) {
+      || scheduleMode === 'single-layer' && (layersPerDuty !== 1 || maxInFlightDuties !== 4)
+      || scheduleMode === 'single-layer-serial' && (layersPerDuty !== 1 || maxInFlightDuties !== 1)) {
       throw new KimodoProducerError('input', `scheduleMode ${scheduleMode} conflicts with the effective submission schedule`);
     }
     const generationId = opts.generationId ?? ++generationCounter;
